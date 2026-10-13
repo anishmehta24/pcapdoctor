@@ -2,7 +2,7 @@
 
 Reads a packet capture and tells you what went wrong on the network, in plain English: failed DNS lookups, refused or reset connections, packet loss, TLS handshake failures, and whether a slow request was the network's fault or the server's.
 
-**Status: early.** Reading captures, listing packets and summarizing conversations works. The diagnosis report is next; see [PLAN.md](PLAN.md).
+**Status: early.** Reading captures, listing packets, summarizing conversations and TCP analysis (retransmissions, duplicate ACKs, zero windows, resets) work. The plain-English diagnosis report is next; see [PLAN.md](PLAN.md).
 
 ## Usage
 
@@ -13,7 +13,7 @@ $ pcapdoctor dump capture.pcap -c 3
      3    0.000322  172.16.5.1:49178 → 172.16.5.10:8443 TCP [ACK] seq=3485596976 ack=3667251319 win=229 len=0
 ```
 
-TCP sequence numbers count from the start of each connection, like Wireshark; `-S` shows the raw values.
+TCP sequence numbers count from the start of each connection, like Wireshark; `-S` shows the raw values. Problems are flagged with Wireshark's labels, e.g. `[TCP Retransmission]` or `[TCP Dup ACK 9#2]`, using the same rules; on the test captures every flag matches tshark.
 
 ```
 $ pcapdoctor stats capture.pcap
@@ -24,7 +24,7 @@ Stream  Client           Server         Packets  Client→Server  Server→Clien
      1  127.0.0.1:38714  127.0.0.1:443       21         3.1 kB         4.4 kB    6.37 s  open
 ```
 
-`stats` also shows the protocol mix and the busiest hosts. Stream numbers match Wireshark's `tcp.stream` and `udp.stream`, so `tcp.stream == 1` in Wireshark shows the same connection.
+`stats` also shows the protocol mix, the busiest hosts, each connection's round-trip time and retransmissions, and a summary of TCP problems. Stream numbers match Wireshark's `tcp.stream` and `udp.stream`, so `tcp.stream == 1` in Wireshark shows the same connection.
 
 Reads pcap and pcapng files directly, with no libpcap or Npcap needed. Supported link layers: Ethernet (with VLAN tags), Linux cooked (`tcpdump -i any`), loopback, and raw IP. Cut-off captures are read up to the last complete packet.
 

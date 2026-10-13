@@ -42,7 +42,7 @@ fn run(packets: Vec<Vec<u8>>) -> (FlowTable, Vec<Option<FlowRef>>, Vec<String>) 
     for (i, data) in packets.into_iter().enumerate() {
         let frame = frame(i as u64 + 1, data);
         let pkt = decode::decode(&frame);
-        let r = table.observe(&frame, &pkt);
+        let r = table.observe(&frame, &pkt).map(|o| o.flow);
         lines.push(describe(&pkt, r.and_then(|r| table.seq_base(r))));
         refs.push(r);
     }

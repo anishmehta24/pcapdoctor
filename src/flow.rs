@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 
+use crate::analyze::tcp::{TcpAnalyzer, TcpEvent, TcpHealth};
 use crate::capture::{Frame, Timestamp};
 use crate::decode::{IPPROTO_TCP, IPPROTO_UDP, Packet, Tcp, TcpFlags, Transport};
 use crate::summary::SeqBase;
@@ -90,10 +91,51 @@ pub struct TcpConn {
     pub established: bool,
     pub fin_from_client: bool,
     pub fin_from_server: bool,
-    /// Who sent the first RST.
-    pub reset_by: Option<Side>,
+    /// The first RST.
+    pub reset: Option<Reset>,
+    /// Problems in each direction: client to server, then server to client.
+    health: [TcpHealth; 2],
+    analyzer: TcpAnalyzer,
+    /// Most recent SYN from the client.
+    last_syn_ts: Option<Timestamp>,
+    /// From that SYN to the first SYN-ACK.
+    syn_to_syn_ack_ns: Option<u64>,
     /// Sequence number that counts as 0, for the client and server directions.
     base_seq: [Option<u32>; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reset {
+    pub by: Side,
+    pub frame: u64,
+    pub kind: ResetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    /// The answer to a SYN: nothing listens on that port, or a firewall said no.
+    Refused,
+    /// One side gave up on a connection that was open or opening.
+    Aborted,
+    /// Sent while closing, after a FIN. Usually harmless.
+    WhileClosing,
+}
+
+/// Handshake timing. The capture point splits the round trip in two: SYN to
+/// SYN-ACK is the part between the capture point and the server, SYN-ACK to
+/// the client's ACK the part between the capture point and the client.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandshakeRtt {
+    /// The whole round trip between client and server, wherever the capture
+    /// was taken: Wireshark's `tcp.analysis.initial_rtt`.
+    pub total: f64,
+    pub server_side: Option<f64>,
+}
+
+impl HandshakeRtt {
+    pub fn client_side(&self) -> Option<f64> {
+        self.server_side.map(|s| (self.total - s).max(0.0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,17 +176,10 @@ impl TcpConn {
         if self.fin_from_client && self.fin_from_server {
             return TcpStatus::Closed;
         }
-        if let Some(side) = self.reset_by {
-            // Only call it refused if we saw the SYN it answered; a capture
-            // that starts with an RST is an abort we joined late.
-            let refused = side == Side::Server
-                && self.syn.is_some()
-                && !self.established
-                && self.syn_ack.is_none();
-            return if refused {
-                TcpStatus::Refused
-            } else {
-                TcpStatus::Reset(side)
+        if let Some(reset) = self.reset {
+            return match reset.kind {
+                ResetKind::Refused => TcpStatus::Refused,
+                ResetKind::Aborted | ResetKind::WhileClosing => TcpStatus::Reset(reset.by),
             };
         }
         if self.fin_from_client || self.fin_from_server {
@@ -163,6 +198,18 @@ impl TcpConn {
         self.syn.is_none() && self.syn_ack.is_none()
     }
 
+    /// Retransmissions, duplicate ACKs and so on in data sent by `side`.
+    pub fn health(&self, side: Side) -> &TcpHealth {
+        &self.health[indexes(side).0]
+    }
+
+    pub fn handshake_rtt(&self) -> Option<HandshakeRtt> {
+        Some(HandshakeRtt {
+            total: self.analyzer.initial_rtt()?,
+            server_side: self.syn_to_syn_ack_ns.map(|ns| ns as f64 / 1e9),
+        })
+    }
+
     /// What to subtract from a segment sent by `side` to show relative numbers.
     pub fn seq_base(&self, side: Side) -> SeqBase {
         let (own, other) = indexes(side);
@@ -172,7 +219,7 @@ impl TcpConn {
         }
     }
 
-    fn update(&mut self, side: Side, tcp: &Tcp, frame: &Frame) {
+    fn update(&mut self, side: Side, tcp: &Tcp, frame: &Frame) -> Vec<TcpEvent> {
         let flags = tcp.flags;
         let (own, other) = indexes(side);
         if flags.has(TcpFlags::SYN) {
@@ -181,8 +228,15 @@ impl TcpConn {
             }
             let seen = Some((frame.number, frame.ts));
             match (side, flags.has(TcpFlags::ACK)) {
-                (Side::Client, false) if self.syn.is_none() => self.syn = seen,
-                (Side::Server, true) if self.syn_ack.is_none() => self.syn_ack = seen,
+                (Side::Client, false) => {
+                    self.syn = self.syn.or(seen);
+                    self.last_syn_ts = Some(frame.ts);
+                }
+                (Side::Server, true) if self.syn_ack.is_none() => {
+                    self.syn_ack = seen;
+                    self.syn_to_syn_ack_ns =
+                        self.last_syn_ts.map(|syn| frame.ts.0.saturating_sub(syn.0));
+                }
                 _ => {}
             }
         } else {
@@ -198,15 +252,35 @@ impl TcpConn {
         if flags.has(TcpFlags::ACK) && self.base_seq[other].is_none() {
             self.base_seq[other] = Some(tcp.ack.wrapping_sub(1));
         }
+        if flags.has(TcpFlags::RST) && self.reset.is_none() {
+            // Only call it refused if we saw the SYN it answered; a capture
+            // that starts with an RST is an abort we joined late.
+            let kind = if side == Side::Server
+                && self.syn.is_some()
+                && !self.established
+                && self.syn_ack.is_none()
+            {
+                ResetKind::Refused
+            } else if self.fin_from_client || self.fin_from_server {
+                ResetKind::WhileClosing
+            } else {
+                ResetKind::Aborted
+            };
+            self.reset = Some(Reset {
+                by: side,
+                frame: frame.number,
+                kind,
+            });
+        }
         if flags.has(TcpFlags::FIN) {
             match side {
                 Side::Client => self.fin_from_client = true,
                 Side::Server => self.fin_from_server = true,
             }
         }
-        if flags.has(TcpFlags::RST) && self.reset_by.is_none() {
-            self.reset_by = Some(side);
-        }
+        let events = self.analyzer.segment(side, tcp, frame.number, frame.ts);
+        self.health[own].record(tcp, frame.number, &events);
+        events
     }
 }
 
@@ -222,6 +296,14 @@ fn indexes(side: Side) -> (usize, usize) {
 pub struct FlowRef {
     pub index: usize,
     pub from: Side,
+}
+
+/// What `FlowTable::observe` learned about a packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    pub flow: FlowRef,
+    /// Retransmissions, duplicate ACKs and so on; always empty for UDP.
+    pub tcp_events: Vec<TcpEvent>,
 }
 
 /// Endpoints in a fixed order, so both directions map to the same key.
@@ -261,7 +343,7 @@ impl FlowTable {
     /// Adds a TCP or UDP packet to its flow, starting a new flow if needed.
     /// Returns `None` for other packets, and for fragments that don't carry
     /// the transport header.
-    pub fn observe(&mut self, frame: &Frame, pkt: &Packet<'_>) -> Option<FlowRef> {
+    pub fn observe(&mut self, frame: &Frame, pkt: &Packet<'_>) -> Option<Observed> {
         let (src_ip, dst_ip) = pkt.network.as_ref()?.ip_addrs()?;
         let (protocol, src_port, dst_port, tcp) = match pkt.transport.as_ref()? {
             Transport::Tcp(t) => (IPPROTO_TCP, t.src_port, t.dst_port, Some(t)),
@@ -294,10 +376,14 @@ impl FlowTable {
         flow.last_frame = frame.number;
         flow.first_ts = flow.first_ts.min(frame.ts);
         flow.last_ts = flow.last_ts.max(frame.ts);
-        if let (Some(conn), Some(tcp)) = (flow.tcp.as_mut(), tcp) {
-            conn.update(from, tcp, frame);
-        }
-        Some(FlowRef { index, from })
+        let tcp_events = match (flow.tcp.as_mut(), tcp) {
+            (Some(conn), Some(tcp)) => conn.update(from, tcp, frame),
+            _ => Vec::new(),
+        };
+        Some(Observed {
+            flow: FlowRef { index, from },
+            tcp_events,
+        })
     }
 
     pub fn flows(&self) -> &[Flow] {

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::IpAddr;
 
+use crate::analyze::tcp::TcpHealth;
 use crate::capture::{Frame, Timestamp};
 use crate::decode::{Link, Network, Packet, Transport};
-use crate::flow::{Counter, Flow, FlowTable};
+use crate::flow::{Counter, Flow, FlowTable, ResetKind, Side, TcpConn, TcpStatus};
 use crate::names;
 use crate::units::{self, Align, Table};
 
@@ -214,6 +215,8 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
             ("Duration", Align::Right),
         ];
         if tcp {
+            columns.push(("RTT", Align::Right));
+            columns.push(("Retrans", Align::Right));
             columns.push(("State", Align::Left));
         }
         let mut table = Table::new(&columns);
@@ -229,6 +232,11 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
                 units::duration(flow.duration_secs()),
             ];
             if let Some(conn) = &flow.tcp {
+                row.push(
+                    conn.handshake_rtt()
+                        .map_or("-".to_string(), |rtt| units::duration(rtt.total)),
+                );
+                row.push(retransmissions(&combined(conn)));
                 let mut state = conn.status().to_string();
                 if conn.started_before_capture() {
                     state.push('*');
@@ -248,8 +256,136 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
         if joined_late {
             let _ = writeln!(out, "* already open when the capture started");
         }
+        if tcp {
+            let _ = write!(
+                out,
+                "
+{}",
+                tcp_problems(flows)
+            );
+        }
     }
     out
+}
+
+/// Both directions of a connection added together.
+fn combined(conn: &TcpConn) -> TcpHealth {
+    let mut health = conn.health(Side::Client).clone();
+    health.add(conn.health(Side::Server));
+    health
+}
+
+fn retransmissions(health: &TcpHealth) -> String {
+    match health.retransmissions.count {
+        0 => "-".to_string(),
+        n => format!("{n} ({})", units::percent(u64::from(n), health.segments)),
+    }
+}
+
+/// Totals over every TCP connection. Only problems that occurred are listed.
+fn tcp_problems(flows: &FlowTable) -> String {
+    let mut total = TcpHealth::default();
+    let (mut retransmitting, mut refused, mut aborted, mut unanswered) = (0u64, 0u64, 0u64, 0u64);
+    for conn in flows.flows().iter().filter_map(|f| f.tcp.as_ref()) {
+        let health = combined(conn);
+        if health.retransmissions.count > 0 {
+            retransmitting += 1;
+        }
+        total.add(&health);
+        match conn.reset.map(|r| r.kind) {
+            Some(ResetKind::Refused) => refused += 1,
+            Some(ResetKind::Aborted) => aborted += 1,
+            Some(ResetKind::WhileClosing) | None => {}
+        }
+        if conn.status() == TcpStatus::NoAnswer {
+            unanswered += 1;
+        }
+    }
+
+    let mut retrans_note = format!(
+        "{} of segments sent, in {} connection{}",
+        units::percent(u64::from(total.retransmissions.count), total.segments),
+        retransmitting,
+        if retransmitting == 1 { "" } else { "s" }
+    );
+    let (fast, spurious) = (
+        total.fast_retransmissions.count,
+        total.spurious_retransmissions.count,
+    );
+    if fast > 0 || spurious > 0 {
+        let _ = write!(retrans_note, "; {fast} fast, {spurious} spurious");
+    }
+    let rows: [(&str, u64, String); 10] = [
+        (
+            "Retransmissions",
+            u64::from(total.retransmissions.count),
+            retrans_note,
+        ),
+        (
+            "Out-of-order segments",
+            u64::from(total.out_of_order.count),
+            String::new(),
+        ),
+        (
+            "Duplicate ACKs",
+            u64::from(total.duplicate_acks.count),
+            String::new(),
+        ),
+        (
+            "Zero window",
+            u64::from(total.zero_windows.count),
+            "receiver had no buffer space left".into(),
+        ),
+        (
+            "Window full",
+            u64::from(total.window_full.count),
+            "sender had to wait for the receiver".into(),
+        ),
+        (
+            "Not captured",
+            u64::from(total.not_captured.count),
+            "gaps in the sequence numbers".into(),
+        ),
+        (
+            "ACKed, not captured",
+            u64::from(total.acked_unseen.count),
+            "acknowledged data the capture never saw".into(),
+        ),
+        (
+            "Refused",
+            refused,
+            "connection attempts answered with RST".into(),
+        ),
+        (
+            "Unanswered",
+            unanswered,
+            "connection attempts with no reply".into(),
+        ),
+        ("Aborted", aborted, "open connections ended by RST".into()),
+    ];
+    let mut table = Table::new(&[
+        ("Problem", Align::Left),
+        ("Count", Align::Right),
+        ("", Align::Left),
+    ]);
+    let mut any = false;
+    for (name, count, note) in rows {
+        if count > 0 {
+            table.row(vec![name.to_string(), units::count(count), note]);
+            any = true;
+        }
+    }
+    if any {
+        format!(
+            "TCP problems
+{}",
+            table.render()
+        )
+    } else {
+        "TCP problems: none found
+"
+        .to_string()
+    }
 }
 
 fn add_protocol_rows(table: &mut Table, node: &ProtocolNode, total: &Counter, depth: usize) {
