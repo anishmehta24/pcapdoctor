@@ -11,6 +11,7 @@
 
 mod arp;
 pub mod dns;
+pub mod http;
 mod ip;
 mod link;
 pub mod tls;

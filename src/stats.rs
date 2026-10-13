@@ -7,6 +7,7 @@ use std::net::IpAddr;
 
 use crate::analyze::Analyzer;
 use crate::analyze::dns::{DnsLog, Lookup, Outcome, SLOW_SECS};
+use crate::analyze::http::{self as http_analysis, Exchange};
 use crate::analyze::tcp::TcpHealth;
 use crate::analyze::tls::{Handshake, TlsResult};
 use crate::capture::{Frame, Timestamp};
@@ -242,6 +243,7 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
         ]);
         if tcp {
             columns.push(("RTT", Align::Right));
+            columns.push(("Wait", Align::Right));
             columns.push(("Retrans", Align::Right));
             columns.push(("State", Align::Left));
         }
@@ -266,6 +268,10 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
                 row.push(
                     conn.handshake_rtt()
                         .map_or("-".to_string(), |rtt| units::duration(rtt.total)),
+                );
+                row.push(
+                    conn.longest_wait
+                        .map_or("-".to_string(), |w| units::duration(w.secs)),
                 );
                 row.push(retransmissions(&combined(conn)));
                 let mut state = conn.status().to_string();
@@ -293,6 +299,129 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
     }
     out.push_str(&dns_section(dns, top));
     out.push_str(&tls_section(analyzer, top));
+    out.push_str(&http_section(analyzer, top));
+    out
+}
+
+/// HTTP requests by status, how long servers took, and the requests that
+/// failed or were slow.
+fn http_section(analyzer: &Analyzer, top: usize) -> String {
+    let exchanges = analyzer.http.exchanges();
+    if exchanges.is_empty() {
+        return String::new();
+    }
+    let flows = analyzer.flows.flows();
+    let conn = |e: &Exchange| flows[e.flow].tcp.as_ref().expect("HTTP runs over TCP");
+    let connections: HashSet<usize> = exchanges.iter().map(|e| e.flow).collect();
+    let mut out = format!(
+        "\nHTTP: {} request{} on {} connection{}\n",
+        units::count(exchanges.len() as u64),
+        if exchanges.len() == 1 { "" } else { "s" },
+        connections.len(),
+        if connections.len() == 1 { "" } else { "s" }
+    );
+
+    // Status classes, with the individual codes for errors.
+    let mut classes: BTreeMap<String, (u64, BTreeMap<u16, u64>)> = BTreeMap::new();
+    for exchange in exchanges {
+        let class = match &exchange.response {
+            Some(r) => format!("{}xx", r.status / 100),
+            None => "no response".to_string(),
+        };
+        let entry = classes.entry(class).or_default();
+        entry.0 += 1;
+        if let Some(r) = exchange.response.as_ref().filter(|r| r.status >= 400) {
+            *entry.1.entry(r.status).or_default() += 1;
+        }
+    }
+    let mut table = Table::new(&[
+        ("Status", Align::Left),
+        ("Count", Align::Right),
+        ("", Align::Left),
+    ]);
+    for (class, (n, codes)) in &classes {
+        let note = codes
+            .iter()
+            .map(|(code, n)| format!("{code}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table.row(vec![class.clone(), units::count(*n), note]);
+    }
+    out.push_str(&table.render());
+
+    let mut server: Vec<f64> = exchanges
+        .iter()
+        .filter_map(|e| e.server_time(conn(e)))
+        .collect();
+    server.sort_by(f64::total_cmp);
+    if !server.is_empty() {
+        let _ = writeln!(
+            out,
+            "Server time: median {}, slowest {}",
+            units::duration(server[server.len() / 2]),
+            units::duration(server[server.len() - 1])
+        );
+    }
+
+    let slow = |e: &Exchange| {
+        let wait = e.server_time(conn(e)).or_else(|| e.time_to_first_byte());
+        wait.is_some_and(|w| w > http_analysis::SLOW_SERVER_SECS)
+    };
+    let mut problems: Vec<&Exchange> = exchanges
+        .iter()
+        .filter(|e| {
+            let failed = e.response.as_ref().is_some_and(|r| r.status >= 400);
+            let unanswered = e.request.is_some() && e.response.is_none();
+            failed || unanswered || slow(e)
+        })
+        .collect();
+    if problems.is_empty() {
+        return out;
+    }
+    // Server errors first, then the slowest.
+    problems.sort_by(|a, b| {
+        let status = |e: &Exchange| e.response.as_ref().map_or(1000, |r| r.status);
+        let wait = |e: &Exchange| e.time_to_first_byte().unwrap_or(0.0);
+        status(b)
+            .cmp(&status(a))
+            .then_with(|| wait(b).total_cmp(&wait(a)))
+    });
+    let mut table = Table::new(&[
+        ("Request", Align::Left),
+        ("Server", Align::Left),
+        ("Status", Align::Left),
+        ("First byte", Align::Right),
+        ("Server time", Align::Right),
+        ("Frame", Align::Right),
+    ]);
+    for exchange in problems.iter().take(top) {
+        table.row(vec![
+            exchange.label(),
+            flows[exchange.flow].server.to_string(),
+            exchange
+                .response
+                .as_ref()
+                .map_or("no response".to_string(), |r| {
+                    format!("{} {}", r.status, r.reason)
+                }),
+            exchange
+                .time_to_first_byte()
+                .map_or("-".to_string(), units::duration),
+            exchange
+                .server_time(conn(exchange))
+                .map_or("-".to_string(), units::duration),
+            exchange
+                .request_frame
+                .or(exchange.response_start.map(|a| a.frame))
+                .map_or("-".to_string(), |f| f.to_string()),
+        ]);
+    }
+    let _ = write!(
+        out,
+        "\n{}{}",
+        heading("Problem requests", problems.len(), top, "worst first"),
+        table.render()
+    );
     out
 }
 
