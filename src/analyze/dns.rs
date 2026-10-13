@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::analyze::stream::{Arrival, Reassembler};
 use crate::capture::{Frame, Timestamp};
 use crate::decode::dns::{self, DnsError, Message, Question, RData, Record};
-use crate::decode::{IPPROTO_UDP, Network, Packet, Quoted, Tcp, TcpFlags, Transport};
+use crate::decode::{IPPROTO_UDP, Network, Packet, Quoted, Tcp, Transport};
 use crate::flow::{Observed, Side};
 use crate::units;
 
@@ -265,7 +266,14 @@ impl DnsLog {
                     .entry((observed.flow.index, observed.flow.from))
                     .or_default();
                 (
-                    stream.push(tcp, pkt.payload),
+                    stream.push(
+                        tcp,
+                        pkt.payload,
+                        Arrival {
+                            frame: frame.number,
+                            ts: frame.ts,
+                        },
+                    ),
                     true,
                     SocketAddr::new(src_ip, tcp.src_port),
                     SocketAddr::new(dst_ip, tcp.dst_port),
@@ -470,75 +478,34 @@ fn reverse_name_to_ip(name: &str) -> Option<IpAddr> {
     Some(IpAddr::V6(Ipv6Addr::from(octets)))
 }
 
-/// Reassembles DNS over TCP, where each message has a 2-byte length prefix
-/// and may be split across segments. Only in-order data is used; after a gap
-/// the message boundaries are lost, so the rest of the direction is skipped.
+/// DNS over TCP: each message has a 2-byte length prefix and may be split
+/// across segments.
 #[derive(Debug, Default)]
 struct TcpStream {
-    next_seq: Option<u32>,
-    buf: Vec<u8>,
-    broken: bool,
+    bytes: Reassembler,
 }
 
 impl TcpStream {
     /// Adds a segment and returns the messages it completes.
-    fn push(&mut self, tcp: &Tcp, payload: &[u8]) -> Vec<Vec<u8>> {
-        // The SYN takes one sequence number; data on it (TCP Fast Open)
-        // starts right after.
-        let mut seq = tcp.seq;
-        if tcp.flags.has(TcpFlags::SYN) {
-            seq = seq.wrapping_add(1);
-            *self = TcpStream {
-                next_seq: Some(seq),
-                ..TcpStream::default()
-            };
-        }
-        if self.broken || tcp.payload_len == 0 {
-            return Vec::new();
-        }
-        if payload.len() < tcp.payload_len as usize {
-            // Cut short by the capture's length limit.
-            self.break_off();
-            return Vec::new();
-        }
-        // Joined mid-connection: hope a message starts here.
-        let next = *self.next_seq.get_or_insert(seq);
-        let overlap = next.wrapping_sub(seq) as i32;
-        if overlap < 0 {
-            self.break_off();
-            return Vec::new();
-        }
-        let Some(new) = payload.get(overlap as usize..).filter(|d| !d.is_empty()) else {
-            return Vec::new(); // a retransmission of data we already have
-        };
-        self.buf.extend_from_slice(new);
-        self.next_seq = Some(next.wrapping_add(new.len() as u32));
-        if self.buf.len() > MAX_TCP_BUFFER {
-            self.break_off();
-            return Vec::new();
-        }
+    fn push(&mut self, tcp: &Tcp, payload: &[u8], at: Arrival) -> Vec<Vec<u8>> {
+        self.bytes.push(tcp, payload, at, MAX_TCP_BUFFER);
         let mut messages = Vec::new();
-        while let [hi, lo, ..] = self.buf[..] {
+        while let [hi, lo, ..] = *self.bytes.data() {
             let len = usize::from(u16::from_be_bytes([hi, lo]));
-            if self.buf.len() < 2 + len {
+            let Some(message) = self.bytes.data().get(2..2 + len) else {
                 break;
-            }
-            messages.push(self.buf[2..2 + len].to_vec());
-            self.buf.drain(..2 + len);
+            };
+            messages.push(message.to_vec());
+            self.bytes.consume(2 + len);
         }
         messages
-    }
-
-    fn break_off(&mut self) {
-        self.broken = true;
-        self.buf = Vec::new();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::TcpOptions;
+    use crate::decode::{TcpFlags, TcpOptions};
 
     fn segment(seq: u32, flags: u16, payload_len: u32) -> Tcp {
         Tcp {
@@ -554,51 +521,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tcp_fast_open_query_on_the_syn() {
-        let mut stream = TcpStream::default();
-        let syn = segment(100, TcpFlags::SYN, 5);
-        assert_eq!(
-            stream.push(&syn, &[0, 3, b'a', b'b', b'c']),
-            vec![b"abc".to_vec()]
-        );
-        // The next segment starts after the SYN's sequence number and its data.
-        let next = segment(106, TcpFlags::ACK | TcpFlags::PSH, 5);
-        assert_eq!(
-            stream.push(&next, &[0, 3, b'x', b'y', b'z']),
-            vec![b"xyz".to_vec()]
-        );
+    fn at() -> Arrival {
+        Arrival {
+            frame: 1,
+            ts: Timestamp(0),
+        }
     }
 
     #[test]
-    fn split_messages_and_gaps() {
+    fn length_prefixed_messages() {
         let mut stream = TcpStream::default();
-        stream.push(&segment(0, TcpFlags::SYN, 0), &[]);
-        assert!(
-            stream
-                .push(&segment(1, TcpFlags::ACK, 3), &[0, 4, b'w'])
-                .is_empty()
-        );
-        // A retransmission of the same bytes changes nothing.
-        assert!(
-            stream
-                .push(&segment(1, TcpFlags::ACK, 3), &[0, 4, b'w'])
-                .is_empty()
-        );
+        // TCP Fast Open: the first message rides on the SYN.
+        let syn = segment(100, TcpFlags::SYN, 5);
         assert_eq!(
-            stream.push(&segment(4, TcpFlags::ACK, 3), b"xyz"),
-            vec![b"wxyz".to_vec()]
+            stream.push(&syn, &[0, 3, b'a', b'b', b'c'], at()),
+            vec![b"abc".to_vec()]
         );
-        // A gap loses the message boundaries for good.
-        assert!(
-            stream
-                .push(&segment(20, TcpFlags::ACK, 3), &[0, 1, b'q'])
-                .is_empty()
-        );
-        assert!(
-            stream
-                .push(&segment(7, TcpFlags::ACK, 3), &[0, 1, b'q'])
-                .is_empty()
+        // One message split across segments, then two in one segment.
+        let first = segment(106, TcpFlags::ACK, 3);
+        assert!(stream.push(&first, &[0, 4, b'w'], at()).is_empty());
+        let second = segment(109, TcpFlags::ACK, 6);
+        assert_eq!(
+            stream.push(&second, &[b'x', b'y', b'z', 0, 1, b'q'], at()),
+            vec![b"wxyz".to_vec(), b"q".to_vec()]
         );
     }
 

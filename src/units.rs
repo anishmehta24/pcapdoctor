@@ -98,6 +98,27 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (year, month, day)
 }
 
+/// The reverse: (year, month, day) to days since 1970-01-01, negative
+/// before it. Hinnant's `days_from_civil`.
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = i64::from((month + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// "2026-10-13" for seconds since the Unix epoch.
+pub fn date(secs: i64) -> String {
+    if secs < 0 {
+        return "before 1970".to_string();
+    }
+    let (year, month, day) = civil_from_days(secs as u64 / 86_400);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
     Left,
@@ -208,6 +229,15 @@ mod tests {
             utc(Timestamp(1_709_164_800_000_000_000)),
             "2024-02-29 00:00:00.000 UTC"
         );
+    }
+
+    #[test]
+    fn days_both_ways() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2024, 2, 29), 19_782);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(date(19_782 * 86_400 + 5), "2024-02-29");
+        assert_eq!(date(-5), "before 1970");
     }
 
     #[test]

@@ -13,7 +13,9 @@ mod arp;
 pub mod dns;
 mod ip;
 mod link;
+pub mod tls;
 mod transport;
+pub mod x509;
 
 use std::fmt;
 use std::net::IpAddr;

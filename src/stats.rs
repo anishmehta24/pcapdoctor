@@ -8,8 +8,10 @@ use std::net::IpAddr;
 use crate::analyze::Analyzer;
 use crate::analyze::dns::{DnsLog, Lookup, Outcome, SLOW_SECS};
 use crate::analyze::tcp::TcpHealth;
+use crate::analyze::tls::{Handshake, TlsResult};
 use crate::capture::{Frame, Timestamp};
 use crate::decode::dns as dns_wire;
+use crate::decode::tls as tls_wire;
 use crate::decode::{Link, Network, Packet, Transport};
 use crate::flow::{Counter, Flow, FlowTable, ResetKind, Side, TcpConn, TcpStatus};
 use crate::names;
@@ -172,7 +174,7 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
     let hosts = stats.busiest_hosts();
     if !hosts.is_empty() {
         let shown = &hosts[..hosts.len().min(top)];
-        let named = shown.iter().any(|(ip, _)| dns.name_of(*ip).is_some());
+        let named = shown.iter().any(|(ip, _)| analyzer.name_of(*ip).is_some());
         let mut columns = vec![("Host", Align::Left)];
         if named {
             columns.push(("Name", Align::Left));
@@ -187,7 +189,7 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
         for (ip, host) in shown {
             let mut row = vec![ip.to_string()];
             if named {
-                row.push(dns.name_of(*ip).unwrap_or("").to_string());
+                row.push(analyzer.name_of(*ip).unwrap_or("").to_string());
             }
             row.extend([
                 units::count(host.sent.packets),
@@ -206,15 +208,16 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
     }
 
     for (name, tcp) in [("TCP", true), ("UDP", false)] {
-        let mut list: Vec<&Flow> = flows
+        let mut list: Vec<(usize, &Flow)> = flows
             .flows()
             .iter()
-            .filter(|f| f.tcp.is_some() == tcp)
+            .enumerate()
+            .filter(|(_, f)| f.tcp.is_some() == tcp)
             .collect();
         if list.is_empty() {
             continue;
         }
-        list.sort_by(|a, b| {
+        list.sort_by(|(_, a), (_, b)| {
             b.bytes()
                 .cmp(&a.bytes())
                 .then_with(|| a.stream.cmp(&b.stream))
@@ -222,7 +225,7 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
         let named = list
             .iter()
             .take(top)
-            .any(|f| dns.name_of(f.server.ip()).is_some());
+            .any(|(i, _)| analyzer.server_name(*i).is_some());
         let mut columns = vec![
             ("Stream", Align::Right),
             ("Client", Align::Left),
@@ -244,14 +247,14 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
         }
         let mut table = Table::new(&columns);
         let mut joined_late = false;
-        for flow in list.iter().take(top) {
+        for &(index, flow) in list.iter().take(top) {
             let mut row = vec![
                 flow.stream.to_string(),
                 flow.client.to_string(),
                 flow.server.to_string(),
             ];
             if named {
-                row.push(dns.name_of(flow.server.ip()).unwrap_or("").to_string());
+                row.push(analyzer.server_name(index).unwrap_or("").to_string());
             }
             row.extend([
                 units::count(flow.packets()),
@@ -289,6 +292,109 @@ pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
         }
     }
     out.push_str(&dns_section(dns, top));
+    out.push_str(&tls_section(analyzer, top));
+    out
+}
+
+/// How TLS handshakes ended, which versions were agreed, and the ones with
+/// problems.
+fn tls_section(analyzer: &Analyzer, top: usize) -> String {
+    let handshakes = analyzer.tls.handshakes();
+    if handshakes.is_empty() {
+        return String::new();
+    }
+    let flows = analyzer.flows.flows();
+    let conn = |h: &Handshake| flows[h.flow].tcp.as_ref().expect("TLS runs over TCP");
+    let mut out = format!(
+        "\nTLS: {} handshake{}\n",
+        units::count(handshakes.len() as u64),
+        if handshakes.len() == 1 { "" } else { "s" }
+    );
+
+    let mut results: BTreeMap<TlsResult, u64> = BTreeMap::new();
+    let mut versions: BTreeMap<u16, u64> = BTreeMap::new();
+    for handshake in handshakes {
+        let result = handshake.result();
+        *results.entry(result).or_default() += 1;
+        if result == TlsResult::Completed
+            && let Some(version) = handshake.version()
+        {
+            *versions.entry(version).or_default() += 1;
+        }
+    }
+    let mut table = Table::new(&[
+        ("Result", Align::Left),
+        ("Count", Align::Right),
+        ("", Align::Left),
+    ]);
+    for (result, n) in &results {
+        let note = if *result == TlsResult::Completed {
+            versions
+                .iter()
+                .rev()
+                .map(|(v, n)| format!("{}: {n}", tls_wire::version_name(*v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
+        table.row(vec![result.to_string(), units::count(*n), note]);
+    }
+    out.push_str(&table.render());
+
+    let problems: Vec<(&Handshake, Vec<String>)> = handshakes
+        .iter()
+        .map(|h| {
+            (
+                h,
+                h.problems(conn(h))
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .filter(|(_, p)| !p.is_empty())
+        .collect();
+    if problems.is_empty() {
+        return out;
+    }
+    let mut table = Table::new(&[
+        ("Server", Align::Left),
+        ("Name", Align::Left),
+        ("Version", Align::Left),
+        ("Problem", Align::Left),
+        ("Hello delay", Align::Right),
+        ("Frame", Align::Right),
+    ]);
+    for (handshake, found) in problems.iter().take(top) {
+        let flow = &flows[handshake.flow];
+        table.row(vec![
+            flow.server.to_string(),
+            handshake.server_name().unwrap_or("").to_string(),
+            handshake
+                .version()
+                .map_or("-".to_string(), tls_wire::version_name),
+            found.join("; "),
+            handshake
+                .server_hello_delay()
+                .map_or("-".to_string(), units::duration),
+            handshake
+                .client_hello
+                .as_ref()
+                .map_or("-".to_string(), |(at, _)| at.frame.to_string()),
+        ]);
+    }
+    let _ = write!(
+        out,
+        "\n{}{}",
+        heading(
+            "Problem handshakes",
+            problems.len(),
+            top,
+            "in capture order"
+        ),
+        table.render()
+    );
     out
 }
 

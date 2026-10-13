@@ -2,7 +2,7 @@
 
 Reads a packet capture and tells you what went wrong on the network, in plain English: failed DNS lookups, refused or reset connections, packet loss, TLS handshake failures, and whether a slow request was the network's fault or the server's.
 
-**Status: early.** Packet listing, conversation summaries, TCP analysis (retransmissions, duplicate ACKs, zero windows, resets, round-trip times) and DNS analysis (failed, missing, slow and retried lookups) work. TLS and HTTP analysis come next, then the plain-English diagnosis report; see [PLAN.md](PLAN.md).
+**Status: early.** Packet listing, conversation summaries, TCP analysis (retransmissions, duplicate ACKs, zero windows, resets, round-trip times) DNS analysis (failed, missing, slow and retried lookups) and TLS analysis (rejected handshakes, certificate problems, slow servers) work. HTTP analysis comes next, then the plain-English diagnosis report; see [PLAN.md](PLAN.md).
 
 ## Usage
 
@@ -24,6 +24,7 @@ $ pcapdoctor dump capture.pcap
 - TCP sequence numbers count from the start of each connection, as in Wireshark; `-S` shows the raw values.
 - TCP problems get Wireshark's labels, e.g. `[TCP Retransmission]` or `[TCP Dup ACK 9#2]`, decided by the same rules.
 - DNS responses show their response time, and ICMP errors point back to the query that caused them.
+- TLS handshakes show the server name, versions and ALPN, the certificate (before TLS 1.3, which encrypts it) and alerts.
 
 `stats` summarizes the whole capture:
 
@@ -45,6 +46,7 @@ It shows:
 - each TCP and UDP conversation, with round-trip time, retransmissions and state
 - a summary of TCP problems
 - DNS results
+- TLS results, with problem handshakes explained, e.g. `client rejected the handshake: unknown_ca (the certificate's issuer is not trusted)` or `certificate is for other.example, not wrong.example`
 
 Stream numbers match Wireshark's `tcp.stream` and `udp.stream`, so `tcp.stream == 1` in Wireshark shows the same connection.
 
