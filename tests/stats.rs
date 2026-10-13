@@ -3,14 +3,14 @@ mod common;
 use std::net::IpAddr;
 
 use common::*;
+use pcapdoctor::analyze::Analyzer;
 use pcapdoctor::capture::{Frame, Timestamp};
 use pcapdoctor::decode::{self, link_type};
-use pcapdoctor::flow::FlowTable;
 use pcapdoctor::stats::{self, Stats};
 
-fn collect(packets: Vec<Vec<u8>>) -> (Stats, FlowTable) {
+fn collect(packets: Vec<Vec<u8>>) -> (Stats, Analyzer) {
     let mut stats = Stats::default();
-    let mut flows = FlowTable::new();
+    let mut flows = Analyzer::new();
     for (i, data) in packets.into_iter().enumerate() {
         let frame = Frame {
             number: i as u64 + 1,

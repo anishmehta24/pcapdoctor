@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use pcapdoctor::analyze::Analyzer;
 use pcapdoctor::capture::{Capture, CaptureError, Frame};
-use pcapdoctor::flow::FlowTable;
 use pcapdoctor::stats::{self, Stats};
 use pcapdoctor::{decode, summary};
 
@@ -35,7 +35,7 @@ enum Command {
         #[arg(short = 'S', long)]
         absolute: bool,
     },
-    /// Summarize the capture: protocols, busiest hosts, conversations
+    /// Summarize the capture: protocols, hosts, conversations, TCP and DNS problems
     Stats {
         /// Capture file (.pcap or .pcapng)
         file: PathBuf,
@@ -66,7 +66,7 @@ fn main() -> ExitCode {
 
 fn dump(path: &Path, count: Option<u64>, absolute: bool) -> Result<()> {
     let mut out = BufWriter::new(io::stdout().lock());
-    let mut flows = FlowTable::new();
+    let mut analyzer = Analyzer::new();
     let mut first_ts = None;
     let end = read_frames(path, |frame| {
         if count.is_some_and(|c| frame.number > c) {
@@ -74,15 +74,12 @@ fn dump(path: &Path, count: Option<u64>, absolute: bool) -> Result<()> {
         }
         let start = *first_ts.get_or_insert(frame.ts);
         let pkt = decode::decode(&frame);
-        let observed = flows.observe(&frame, &pkt);
-        let seq_base = match &observed {
-            Some(o) if !absolute => flows.seq_base(o.flow),
+        let found = analyzer.observe(&frame, &pkt);
+        let seq_base = match &found.flow {
+            Some(o) if !absolute => analyzer.flows.seq_base(o.flow),
             _ => None,
         };
-        let mut text = summary::describe(&pkt, seq_base);
-        for event in observed.iter().flat_map(|o| &o.tcp_events) {
-            text.push_str(&format!(" [{event}]"));
-        }
+        let text = summary::describe_with(&pkt, &found, seq_base);
         let line = writeln!(
             out,
             "{:>6} {:>11.6}  {}",
@@ -103,14 +100,14 @@ fn dump(path: &Path, count: Option<u64>, absolute: bool) -> Result<()> {
 
 fn stats(path: &Path, top: usize) -> Result<()> {
     let mut stats = Stats::default();
-    let mut flows = FlowTable::new();
+    let mut analyzer = Analyzer::new();
     let end = read_frames(path, |frame| {
         let pkt = decode::decode(&frame);
-        flows.observe(&frame, &pkt);
+        analyzer.observe(&frame, &pkt);
         stats.add(&frame, &pkt);
         Ok(ControlFlow::Continue(()))
     })?;
-    let report = stats::render(&stats, &flows, top);
+    let report = stats::render(&stats, &analyzer, top);
     ignore_broken_pipe(io::stdout().lock().write_all(report.as_bytes()))?;
     end.warn(path);
     Ok(())

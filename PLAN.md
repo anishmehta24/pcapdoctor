@@ -82,10 +82,15 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
 - **Done when:** counts match tshark's `tcp.analysis.*` on samples and on captures made with `tc netem` loss, apart from documented differences.
 - **Status:** the rules follow Wireshark's `tcp_analyze_sequence_number`, in the same order. Every flag matches tshark on 2,161 TCP frames (198 flagged) across 21 captures, including `tests/fixtures/tcp-zoo.pcap`, a generated capture with one connection per case so all 14 kinds of flag are covered. Initial RTT matches tshark on all 19 connections that have one. Still to do: a real capture with `tc netem` loss.
 
-### M4 DNS
+### M4 DNS — done 2026-10-13
 - Wire format: header, questions, answers (A, AAAA, CNAME, ...), name compression with loop protection; over UDP and TCP
 - Match responses to queries (ID + flow). Report rcode failures (NXDOMAIN, SERVFAIL, REFUSED), queries with no response, slow responses, and ICMP port unreachable from the DNS server.
 - IP → hostname map built from answers, so reports say `api.example.com` instead of `93.184.216.34`
+- **Status:** checked against tshark on 170 DNS messages: ID, query or response, name, type, response code, answer count and response time all match, apart from two intended differences.
+  - A query repeated more than 5 s later is still a retry of the same lookup. Wireshark starts a new transaction, but the client was waiting all along, so the response time counts from the first query. This is how a 5-second DNS stall shows up.
+  - A response must come from the server the query went to. Wireshark matches on the ID alone.
+  `tests/fixtures/dns-zoo.pcap` has one connection per case (error codes, no response, ICMP unreachable, retries, truncation then TCP, IPv6, malformed names), and tshark's view of it is committed.
+  Not covered: multicast DNS and LLMNR (other ports), and encrypted DNS (DoH, DoT).
 
 ### M5 TLS and HTTP
 - TLS records and handshake: ClientHello SNI, ALPN, offered versions; ServerHello chosen version; alerts (handshake_failure, unknown_ca, certificate_expired, protocol_version, ...)

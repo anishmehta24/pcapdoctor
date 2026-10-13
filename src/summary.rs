@@ -4,6 +4,7 @@
 use std::fmt::Write;
 use std::net::SocketAddr;
 
+use crate::analyze::PacketFindings;
 use crate::decode::{Arp, Icmp, Link, Network, Packet, Tcp, TcpFlags, Transport};
 use crate::names;
 
@@ -31,6 +32,47 @@ pub fn describe(pkt: &Packet<'_>, seq_base: Option<SeqBase>) -> String {
             line.push(' ');
         }
         let _ = write!(line, "[{err}]");
+    }
+    line
+}
+
+/// The `dump` line for a packet, including what the analysis found: TCP
+/// flags such as retransmissions, and DNS queries and responses.
+pub fn describe_with(
+    pkt: &Packet<'_>,
+    found: &PacketFindings,
+    seq_base: Option<SeqBase>,
+) -> String {
+    let dns = &found.dns;
+    let dns_text = || -> String {
+        let mut parts: Vec<String> = dns.messages.iter().map(|m| m.summary()).collect();
+        if let Some(err) = &dns.error {
+            parts.push(format!("[{err}]"));
+        }
+        parts.join("; ")
+    };
+    let has_dns = !dns.messages.is_empty() || dns.error.is_some();
+    let mut line = match (
+        &pkt.transport,
+        pkt.network.as_ref().and_then(Network::ip_addrs),
+    ) {
+        // For DNS over UDP the DNS summary replaces "UDP len=N".
+        (Some(Transport::Udp(udp)), Some((src, dst))) if has_dns => format!(
+            "{} → {} DNS {}",
+            SocketAddr::new(src, udp.src_port),
+            SocketAddr::new(dst, udp.dst_port),
+            dns_text()
+        ),
+        _ => describe(pkt, seq_base),
+    };
+    for event in found.flow.iter().flat_map(|o| &o.tcp_events) {
+        let _ = write!(line, " [{event}]");
+    }
+    if has_dns && matches!(pkt.transport, Some(Transport::Tcp(_))) {
+        let _ = write!(line, " DNS {}", dns_text());
+    }
+    if let Some(frame) = dns.icmp_about {
+        let _ = write!(line, " [about the DNS query in frame {frame}]");
     }
     line
 }

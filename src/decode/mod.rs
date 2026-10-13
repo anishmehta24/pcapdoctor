@@ -10,6 +10,7 @@
 //! size for captures that only kept the first bytes of each packet.
 
 mod arp;
+pub mod dns;
 mod ip;
 mod link;
 mod transport;
@@ -70,6 +71,66 @@ pub enum Transport {
     Udp(Udp),
     Icmp(Icmp),
     Other { protocol: u8 },
+}
+
+/// The start of the packet an ICMP error is about, which the error quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quoted<'a> {
+    pub protocol: u8,
+    pub src: IpAddr,
+    pub dst: IpAddr,
+    /// Source and destination port, for TCP and UDP.
+    pub ports: Option<(u16, u16)>,
+    /// Whatever was quoted after the UDP header; empty for other protocols.
+    pub udp_payload: &'a [u8],
+}
+
+impl<'a> Packet<'a> {
+    /// For ICMP errors (destination unreachable, time exceeded and the
+    /// like), the packet that caused the error.
+    pub fn icmp_quoted(&self) -> Option<Quoted<'a>> {
+        let Some(Transport::Icmp(icmp)) = &self.transport else {
+            return None;
+        };
+        let is_error = if icmp.v6 {
+            matches!(icmp.icmp_type, 1..=4)
+        } else {
+            matches!(icmp.icmp_type, 3 | 4 | 5 | 11 | 12)
+        };
+        if !is_error {
+            return None;
+        }
+        // The rest of the 8-byte ICMP header, then the original IP packet.
+        let inner = self.payload.get(4..)?;
+        let (src, dst, protocol, rest): (IpAddr, IpAddr, u8, &[u8]) = match inner.first()? >> 4 {
+            4 => {
+                let (h, rest, _) = ip::decode_v4(inner, 0).ok()?;
+                if h.fragment_offset != 0 {
+                    return None;
+                }
+                (h.src.into(), h.dst.into(), h.protocol, rest)
+            }
+            6 => {
+                let (h, rest, _) = ip::decode_v6(inner, 0).ok()?;
+                (h.src.into(), h.dst.into(), h.protocol, rest)
+            }
+            _ => return None,
+        };
+        let ports = matches!(protocol, IPPROTO_TCP | IPPROTO_UDP)
+            .then(|| (rest.len() >= 4).then(|| (be16(rest, 0), be16(rest, 2))))
+            .flatten();
+        let udp_payload = match protocol {
+            IPPROTO_UDP => rest.get(8..).unwrap_or(&[]),
+            _ => &[],
+        };
+        Some(Quoted {
+            protocol,
+            src,
+            dst,
+            ports,
+            udp_payload,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
