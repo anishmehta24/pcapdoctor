@@ -135,7 +135,12 @@ impl TcpConn {
             return TcpStatus::Closed;
         }
         if let Some(side) = self.reset_by {
-            let refused = side == Side::Server && !self.established && self.syn_ack.is_none();
+            // Only call it refused if we saw the SYN it answered; a capture
+            // that starts with an RST is an abort we joined late.
+            let refused = side == Side::Server
+                && self.syn.is_some()
+                && !self.established
+                && self.syn_ack.is_none();
             return if refused {
                 TcpStatus::Refused
             } else {
@@ -358,11 +363,15 @@ fn client_and_server(
         };
     }
     // Otherwise go by the ports: servers listen on well-known or registered
-    // ports, clients send from high ephemeral ones.
+    // ports, clients send from ephemeral ones. Linux picks ephemeral ports
+    // from 32768 up, Windows and macOS from 49152 up (the IANA range), so
+    // 32768-49151 ranks between: a client port on Linux, but a server port
+    // when the other end is a Windows client.
     let rank = |port: u16| match port {
         0..1024 => 0,
         1024..32768 => 1,
-        _ => 2,
+        32768..49152 => 2,
+        _ => 3,
     };
     match rank(src.port()).cmp(&rank(dst.port())) {
         Ordering::Less => (dst, src),

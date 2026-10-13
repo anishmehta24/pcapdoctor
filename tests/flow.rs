@@ -238,3 +238,33 @@ fn non_ip_packets_have_no_flow() {
     assert_eq!(refs[0], None);
     assert!(table.flows().is_empty());
 }
+
+#[test]
+fn rst_without_an_observed_syn_is_not_refused() {
+    // The capture starts with the server's RST; the SYN it answered wasn't captured.
+    let (table, _, _) = run(vec![seg(false, 0, 1001, RST | ACK, 0)]);
+    assert_eq!(status(&table, 0), TcpStatus::Reset(Side::Server));
+}
+
+#[test]
+fn server_port_in_linux_ephemeral_range_with_windows_client() {
+    // Server listens on 40000; the Windows client uses 50000. The capture
+    // starts with the server's response, so there's no SYN to go by.
+    let packet = |src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16| {
+        ethernet(0x0800, &ipv4(src, dst, 17, &udp(sport, dport, b"x")))
+    };
+    let (table, _, _) = run(vec![
+        packet(SERVER, CLIENT, 40000, 50000),
+        packet(CLIENT, SERVER, 50000, 40000),
+    ]);
+    assert_eq!(table.flows()[0].server.to_string(), "10.0.0.2:40000");
+}
+
+#[test]
+fn linux_client_port_against_registered_server_port() {
+    let packet = |src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16| {
+        ethernet(0x0800, &ipv4(src, dst, 17, &udp(sport, dport, b"x")))
+    };
+    let (table, _, _) = run(vec![packet(SERVER, CLIENT, 8080, 35000)]);
+    assert_eq!(table.flows()[0].server.to_string(), "10.0.0.2:8080");
+}
