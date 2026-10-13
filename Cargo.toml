@@ -1,0 +1,18 @@
+[package]
+name = "pcapdoctor"
+version = "0.1.0"
+edition = "2024"
+description = "Reads a packet capture and tells you what went wrong, in plain English"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/anishmehta24/pcapdoctor"
+keywords = ["pcap", "network", "tcp", "dns", "diagnostics"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
