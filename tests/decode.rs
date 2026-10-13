@@ -48,7 +48,7 @@ fn syn_with_options() {
     assert_eq!(tcp.options.timestamps, Some((1, 0)));
     assert_eq!(tcp.payload_len, 0);
     assert_eq!(
-        describe(&pkt),
+        describe(&pkt, None),
         "10.0.0.1:51234 → 93.184.216.34:443 TCP [SYN] seq=1000 win=64240 len=0 mss=1460 wscale=7 sack_perm"
     );
 }
@@ -147,7 +147,7 @@ fn ipv6_extension_headers_are_skipped() {
     };
     assert_eq!(ip.protocol, 17);
     assert_eq!(
-        describe(&pkt),
+        describe(&pkt, None),
         "[2001:db8::1]:40000 → [2001:db8::2]:53 UDP len=1"
     );
 }
@@ -183,7 +183,7 @@ fn ipv4_later_fragment_has_no_transport_header() {
     };
     assert_eq!(h.fragment_offset, 1480);
     assert_eq!(pkt.transport, None);
-    assert!(describe(&pkt).contains("IPv4 fragment offset=1480 (UDP)"));
+    assert!(describe(&pkt, None).contains("IPv4 fragment offset=1480 (UDP)"));
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn raw_ip() {
     let ip = ipv6("::1", "::1", 58, &[128, 0, 0, 0, 0, 1, 0, 1]);
     let pkt = decode_bytes(link_type::RAW, &ip, ip.len() as u32);
     assert_eq!(pkt.link, Link::RawIp);
-    assert_eq!(describe(&pkt), "::1 → ::1 ICMPv6 echo request");
+    assert_eq!(describe(&pkt, None), "::1 → ::1 ICMPv6 echo request");
 }
 
 #[test]
@@ -235,12 +235,15 @@ fn arp_request_and_reply() {
         panic!("expected ARP")
     };
     assert_eq!(a.sender_ip, Some(Ipv4Addr::new(10, 0, 0, 1)));
-    assert_eq!(describe(&pkt), "ARP who has 10.0.0.254? tell 10.0.0.1");
+    assert_eq!(
+        describe(&pkt, None),
+        "ARP who has 10.0.0.254? tell 10.0.0.1"
+    );
 
     arp[7] = 2;
     let frame = ethernet(0x0806, &arp);
     let pkt = decode_eth(&frame);
-    assert_eq!(describe(&pkt), "ARP 10.0.0.1 is at 02:00:00:00:00:01");
+    assert_eq!(describe(&pkt, None), "ARP 10.0.0.1 is at 02:00:00:00:00:01");
 }
 
 #[test]
@@ -258,7 +261,7 @@ fn bad_ipv4_header_length_keeps_link_layer() {
     ));
     assert_eq!(pkt.network, None);
     assert_eq!(
-        describe(&pkt),
+        describe(&pkt, None),
         "02:00:00:00:00:01 → 02:00:00:00:00:02 IPv4 [malformed IPv4: header length 12 is below the minimum of 20]"
     );
 }
@@ -276,7 +279,7 @@ fn ip_addresses_for_reports() {
 fn unsupported_link_type_is_not_an_error() {
     let pkt = decode_bytes(147, &[1, 2, 3], 3);
     assert_eq!(pkt.error, None);
-    assert_eq!(describe(&pkt), "link type 147 (not decoded)");
+    assert_eq!(describe(&pkt, None), "link type 147 (not decoded)");
 }
 
 /// Mutated and truncated versions of valid packets must never panic. Starting
@@ -335,6 +338,6 @@ fn mutated_packets_never_panic() {
         let link = link_types[rng.below(link_types.len())];
         let orig_len = (data.len() + rng.below(100)) as u32;
         let pkt = decode_bytes(link, &data, orig_len);
-        let _ = describe(&pkt);
+        let _ = describe(&pkt, None);
     }
 }
