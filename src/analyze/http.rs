@@ -342,12 +342,9 @@ fn read(
                 }
                 events.push(HttpEvent::Request(request));
             }
-            Message::Response(response) if response.status < 200 => {
+            Message::Response(response) if response.status < 200 && response.status != 101 => {
                 // Interim: "100 Continue" and friends; the final response
-                // follows. "101 Switching Protocols" leaves HTTP behind.
-                if response.status == 101 {
-                    stop_both = true;
-                }
+                // follows.
                 let request_frame = waiting.front().and_then(|&i| exchanges[i].request_frame);
                 events.push(HttpEvent::Response {
                     response,
@@ -365,13 +362,18 @@ fn read(
                 });
                 let exchange = &mut exchanges[i];
                 let method = exchange.request.as_ref().map(|r| r.method.clone());
-                let body = response_body(method.as_deref(), &response);
+                // "101 Switching Protocols" answers the request and leaves
+                // HTTP behind: no body, and what follows is another protocol.
+                let upgraded = response.status == 101;
+                let body = (!upgraded)
+                    .then(|| response_body(method.as_deref(), &response))
+                    .flatten();
                 exchange.response = Some(response.clone());
                 exchange.response_start = start;
                 exchange.response_end = if body.is_none() { end } else { None };
                 let first_byte = exchange.time_to_first_byte();
                 let request_frame = exchange.request_frame;
-                if method.as_deref() == Some("CONNECT") && response.status / 100 == 2 {
+                if upgraded || method.as_deref() == Some("CONNECT") && response.status / 100 == 2 {
                     stop_both = true;
                 } else if body.is_some() {
                     dir.body = body;

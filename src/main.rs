@@ -4,21 +4,64 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use pcapdoctor::analyze::Analyzer;
 use pcapdoctor::capture::{Capture, CaptureError, Frame};
+use pcapdoctor::report::{html, json, text};
 use pcapdoctor::stats::{self, Stats};
-use pcapdoctor::{decode, summary};
+use pcapdoctor::{decode, diagnose, summary};
+
+/// Findings shown in text output unless `--all` is given.
+const TEXT_FINDINGS: usize = 30;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Reads a packet capture and tells you what went wrong"
+    about = "Reads a packet capture and tells you what went wrong",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    #[command(flatten)]
+    report: ReportArgs,
+}
+
+/// `pcapdoctor FILE`: the diagnosis report.
+#[derive(Args)]
+struct ReportArgs {
+    /// Capture file (.pcap or .pcapng)
+    #[arg(required = true)]
+    file: Option<PathBuf>,
+    /// Output format
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+    /// Write the report to this file instead of the terminal
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Show every finding; text output stops after 30 otherwise
+    #[arg(short, long)]
+    all: bool,
+    /// When to color text output
+    #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
+    color: ColorWhen,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+    Html,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ColorWhen {
+    /// When writing to a terminal, unless NO_COLOR is set
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]
@@ -48,12 +91,13 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Dump {
+        Some(Command::Dump {
             file,
             count,
             absolute,
-        } => dump(&file, count, absolute),
-        Command::Stats { file, top } => stats(&file, top),
+        }) => dump(&file, count, absolute),
+        Some(Command::Stats { file, top }) => stats(&file, top),
+        None => report(cli.report),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -111,6 +155,44 @@ fn stats(path: &Path, top: usize) -> Result<()> {
     ignore_broken_pipe(io::stdout().lock().write_all(report.as_bytes()))?;
     end.warn(path);
     Ok(())
+}
+
+fn report(args: ReportArgs) -> Result<()> {
+    let path = args.file.expect("clap requires a file");
+    let mut stats = Stats::default();
+    let mut analyzer = Analyzer::new();
+    let end = read_frames(&path, |frame| {
+        let pkt = decode::decode(&frame);
+        analyzer.observe(&frame, &pkt);
+        stats.add(&frame, &pkt);
+        Ok(ControlFlow::Continue(()))
+    })?;
+    let cut_off = match end {
+        End::CutOff { frames } => Some(frames),
+        End::Complete => None,
+    };
+    let diagnosis = diagnose::diagnose(&stats, &analyzer, cut_off);
+    let name = path.display().to_string();
+    let body = match args.format {
+        Format::Text => text::render(&name, &diagnosis, (!args.all).then_some(TEXT_FINDINGS)),
+        Format::Json => json::render(&name, &diagnosis),
+        Format::Html => html::render(&name, &diagnosis),
+    };
+    if let Some(output) = &args.output {
+        let body = match args.format {
+            Format::Text => anstream::adapter::strip_str(&body).to_string(),
+            Format::Json | Format::Html => body,
+        };
+        return std::fs::write(output, body)
+            .with_context(|| format!("cannot write {}", output.display()));
+    }
+    let choice = match (args.format, args.color) {
+        (Format::Text, ColorWhen::Auto) => anstream::ColorChoice::Auto,
+        (Format::Text, ColorWhen::Always) => anstream::ColorChoice::Always,
+        _ => anstream::ColorChoice::Never,
+    };
+    let mut out = anstream::AutoStream::new(io::stdout().lock(), choice);
+    ignore_broken_pipe(out.write_all(body.as_bytes()).and_then(|()| out.flush()))
 }
 
 /// How reading a capture ended.

@@ -19,10 +19,19 @@ use crate::summary::SeqBase;
 const DEFAULT_QUIET_SECS: f64 = 0.2;
 const MIN_QUIET_SECS: f64 = 0.05;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
     Client,
     Server,
+}
+
+impl Side {
+    pub fn other(self) -> Side {
+        match self {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

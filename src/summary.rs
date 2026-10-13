@@ -196,39 +196,5 @@ fn arp_info(arp: &Arp) -> String {
 }
 
 fn icmp_info(icmp: &Icmp) -> String {
-    let text = if icmp.v6 {
-        match (icmp.icmp_type, icmp.code) {
-            (1, 1) => "destination unreachable (administratively prohibited)",
-            (1, 3) => "destination unreachable (address unreachable)",
-            (1, 4) => "destination unreachable (port unreachable)",
-            (1, _) => "destination unreachable",
-            (2, _) => "packet too big",
-            (3, _) => "hop limit exceeded",
-            (128, _) => "echo request",
-            (129, _) => "echo reply",
-            (133, _) => "router solicitation",
-            (134, _) => "router advertisement",
-            (135, _) => "neighbor solicitation",
-            (136, _) => "neighbor advertisement",
-            (137, _) => "redirect",
-            (143, _) => "multicast listener report v2",
-            (t, c) => return format!("type {t} code {c}"),
-        }
-    } else {
-        match (icmp.icmp_type, icmp.code) {
-            (0, _) => "echo reply",
-            (3, 0) => "destination unreachable (network unreachable)",
-            (3, 1) => "destination unreachable (host unreachable)",
-            (3, 3) => "destination unreachable (port unreachable)",
-            (3, 4) => "destination unreachable (fragmentation needed)",
-            (3, 9 | 10 | 13) => "destination unreachable (administratively prohibited)",
-            (3, _) => "destination unreachable",
-            (5, _) => "redirect",
-            (8, _) => "echo request",
-            (11, 0) => "time exceeded (TTL expired in transit)",
-            (11, _) => "time exceeded (fragment reassembly)",
-            (t, c) => return format!("type {t} code {c}"),
-        }
-    };
-    text.to_string()
+    names::icmp(icmp.v6, icmp.icmp_type, icmp.code)
 }
