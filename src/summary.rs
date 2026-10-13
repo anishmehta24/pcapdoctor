@@ -5,10 +5,24 @@ use std::fmt::Write;
 use std::net::SocketAddr;
 
 use crate::decode::{Arp, Icmp, Link, Network, Packet, Tcp, TcpFlags, Transport};
+use crate::names;
 
-pub fn describe(pkt: &Packet<'_>) -> String {
+/// Values subtracted from a TCP segment's sequence and acknowledgement
+/// numbers, so they count from the start of the connection the way Wireshark
+/// shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeqBase {
+    pub seq: u32,
+    pub ack: u32,
+}
+
+/// Describes `pkt` in one line. TCP numbers are shown relative to `seq_base`
+/// when given, and as raw values otherwise.
+pub fn describe(pkt: &Packet<'_>, seq_base: Option<SeqBase>) -> String {
     let mut line = match (&pkt.network, &pkt.transport) {
-        (Some(net), Some(transport)) => describe_transport(net, transport),
+        (Some(net), Some(transport)) => {
+            describe_transport(net, transport, seq_base.unwrap_or_default())
+        }
         (Some(net), None) => describe_network(&pkt.link, net),
         (None, _) => describe_link(&pkt.link, pkt.error.is_some()),
     };
@@ -21,7 +35,7 @@ pub fn describe(pkt: &Packet<'_>) -> String {
     line
 }
 
-fn describe_transport(net: &Network, transport: &Transport) -> String {
+fn describe_transport(net: &Network, transport: &Transport, base: SeqBase) -> String {
     let Some((src, dst)) = net.ip_addrs() else {
         return String::new();
     };
@@ -30,7 +44,7 @@ fn describe_transport(net: &Network, transport: &Transport) -> String {
             "{} → {} TCP {}",
             SocketAddr::new(src, tcp.src_port),
             SocketAddr::new(dst, tcp.dst_port),
-            tcp_info(tcp)
+            tcp_info(tcp, base)
         ),
         Transport::Udp(udp) => format!(
             "{} → {} UDP len={}",
@@ -42,14 +56,14 @@ fn describe_transport(net: &Network, transport: &Transport) -> String {
             let name = if icmp.v6 { "ICMPv6" } else { "ICMP" };
             format!("{src} → {dst} {name} {}", icmp_info(icmp))
         }
-        Transport::Other { protocol } => format!("{src} → {dst} {}", ip_protocol_name(*protocol)),
+        Transport::Other { protocol } => format!("{src} → {dst} {}", names::ip_protocol(*protocol)),
     }
 }
 
-fn tcp_info(tcp: &Tcp) -> String {
-    let mut s = format!("[{}] seq={}", tcp.flags, tcp.seq);
+fn tcp_info(tcp: &Tcp, base: SeqBase) -> String {
+    let mut s = format!("[{}] seq={}", tcp.flags, tcp.seq.wrapping_sub(base.seq));
     if tcp.flags.has(TcpFlags::ACK) {
-        let _ = write!(s, " ack={}", tcp.ack);
+        let _ = write!(s, " ack={}", tcp.ack.wrapping_sub(base.ack));
     }
     let _ = write!(s, " win={} len={}", tcp.window, tcp.payload_len);
     let opts = &tcp.options;
@@ -62,7 +76,9 @@ fn tcp_info(tcp: &Tcp) -> String {
     if opts.sack_permitted {
         s.push_str(" sack_perm");
     }
+    // SACK edges acknowledge the other direction's data, like the ack field.
     for (left, right) in &opts.sack {
+        let (left, right) = (left.wrapping_sub(base.ack), right.wrapping_sub(base.ack));
         let _ = write!(s, " sack={left}-{right}");
     }
     s
@@ -75,25 +91,25 @@ fn describe_network(link: &Link, net: &Network) -> String {
             h.src,
             h.dst,
             h.fragment_offset,
-            ip_protocol_name(h.protocol)
+            names::ip_protocol(h.protocol)
         ),
-        Network::Ipv4(h) => format!("{} → {} {}", h.src, h.dst, ip_protocol_name(h.protocol)),
+        Network::Ipv4(h) => format!("{} → {} {}", h.src, h.dst, names::ip_protocol(h.protocol)),
         Network::Ipv6(h) => match h.fragment {
             Some(frag) if frag.offset > 0 => format!(
                 "{} → {} IPv6 fragment offset={} ({})",
                 h.src,
                 h.dst,
                 frag.offset,
-                ip_protocol_name(h.protocol)
+                names::ip_protocol(h.protocol)
             ),
-            _ => format!("{} → {} {}", h.src, h.dst, ip_protocol_name(h.protocol)),
+            _ => format!("{} → {} {}", h.src, h.dst, names::ip_protocol(h.protocol)),
         },
         Network::Arp(arp) => arp_info(arp),
         Network::Other { ethertype } => match link {
             Link::Ethernet { src, dst, .. } => {
-                format!("{src} → {dst} {}", ethertype_name(*ethertype))
+                format!("{src} → {dst} {}", names::ethertype(*ethertype))
             }
-            _ => ethertype_name(*ethertype),
+            _ => names::ethertype(*ethertype),
         },
     }
 }
@@ -106,16 +122,8 @@ fn describe_link(link: &Link, has_error: bool) -> String {
             dst,
             ethertype,
             ..
-        } if *ethertype < 0x0600 => {
-            format!("{src} → {dst} 802.3 LLC")
-        }
-        Link::Ethernet {
-            src,
-            dst,
-            ethertype,
-            ..
         } => {
-            format!("{src} → {dst} {}", ethertype_name(*ethertype))
+            format!("{src} → {dst} {}", names::ethertype(*ethertype))
         }
         Link::Unsupported(lt) if !has_error => format!("link type {lt} (not decoded)"),
         _ => String::new(),
@@ -172,40 +180,4 @@ fn icmp_info(icmp: &Icmp) -> String {
         }
     };
     text.to_string()
-}
-
-fn ip_protocol_name(protocol: u8) -> String {
-    let name = match protocol {
-        1 => "ICMP",
-        2 => "IGMP",
-        6 => "TCP",
-        17 => "UDP",
-        47 => "GRE",
-        50 => "ESP",
-        51 => "AH",
-        58 => "ICMPv6",
-        89 => "OSPF",
-        103 => "PIM",
-        112 => "VRRP",
-        132 => "SCTP",
-        p => return format!("IP protocol {p}"),
-    };
-    name.to_string()
-}
-
-fn ethertype_name(ethertype: u16) -> String {
-    let name = match ethertype {
-        0x0800 => "IPv4",
-        0x0806 => "ARP",
-        0x86dd => "IPv6",
-        0x8035 => "RARP",
-        0x8847 | 0x8848 => "MPLS",
-        0x8863 => "PPPoE discovery",
-        0x8864 => "PPPoE session",
-        0x888e => "EAPOL (802.1X)",
-        0x88cc => "LLDP",
-        0x88e5 => "MACsec",
-        t => return format!("EtherType {t:#06x}"),
-    };
-    name.to_string()
 }

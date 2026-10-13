@@ -55,7 +55,7 @@ fn dump_prints_one_line_per_packet() {
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines[1],
-        "     2    0.001500  10.0.0.2:80 → 10.0.0.1:50000 TCP [SYN, ACK] seq=900 ack=101 win=64240 len=0"
+        "     2    0.001500  10.0.0.2:80 → 10.0.0.1:50000 TCP [SYN, ACK] seq=0 ack=1 win=64240 len=0"
     );
 }
 
@@ -84,4 +84,27 @@ fn non_capture_file_exits_with_2() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("not a pcap or pcapng file"), "{stderr}");
+}
+
+#[test]
+fn absolute_flag_shows_raw_sequence_numbers() {
+    let out = run("absolute", &handshake().bytes(), &["dump", "-S"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[SYN, ACK] seq=900 ack=101 "), "{stdout}");
+}
+
+#[test]
+fn stats_lists_conversations() {
+    let out = run("stats", &handshake().bytes(), &["stats"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("TCP conversations: 1\n"), "{stdout}");
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("10.0.0.1:50000"))
+        .unwrap();
+    assert!(
+        row.contains("10.0.0.2:80") && row.ends_with("open"),
+        "{row}"
+    );
 }

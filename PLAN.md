@@ -30,7 +30,7 @@ Who it's for: support engineers handed a customer's capture, backend developers 
 |---|---|---|
 | `pcapdoctor dump FILE [-c N]` | one line per packet, like tcpdump | M1 |
 | `pcapdoctor dump FILE -f FILTER` | same, filtered | M7 |
-| `pcapdoctor stats FILE` | protocol mix, top talkers, conversations | M2 |
+| `pcapdoctor stats FILE [-n N]` | protocol mix, busiest hosts, conversations | M2 |
 | `pcapdoctor FILE [--format text\|json\|html]` | diagnosis report (default command) | M6 |
 | `pcapdoctor check FILE --fail-on FILTER` | CI mode: exit 1 when something matches | M7 |
 | `pcapdoctor live -i IFACE -d 30s` | capture, then diagnose | M8 |
@@ -65,12 +65,13 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
 - **Done when:** every layer has tests, the no-panic tests pass, and `dump` agrees with tshark on the sample captures.
 - **Status:** 37 tests pass, including mutation tests (50k packets, 20k files). On 9 Wireshark sample captures, all 191 TCP/UDP packets match an independent decoder (Python `dpkt`) field for field. Still to do: compare with tshark once Wireshark is installed.
 
-### M2 Flows and stats
+### M2 Flows and stats — done 2026-10-13, except the tshark comparison
 - Flow table keyed by normalized 5-tuple; per-direction packets, bytes, first and last seen
 - TCP connection state: SYN, SYN-ACK, established, FIN, RST
 - Relative sequence numbers in `dump`
 - `stats`: protocol distribution (packets and bytes), top talkers, conversation table, packets per second
 - **Done when:** the conversation table matches `tshark -z conv,tcp`.
+- **Status:** 59 tests pass. On the same 9 sample captures, all 19 conversations match dpkt: packets, and bytes in each direction. Still to do: compare with tshark.
 
 ### M3 TCP health
 - RTT from the handshake, split into client side and server side
