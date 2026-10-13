@@ -62,6 +62,10 @@ pub struct AlertSeen {
     pub arrival: Arrival,
     /// `None` when the alert was encrypted.
     pub alert: Option<Alert>,
+    /// Sent before the handshake finished. Decided as records are read, in
+    /// order, so an alert right after Finished in the same packet counts as
+    /// after.
+    pub during_handshake: bool,
 }
 
 impl AlertSeen {
@@ -228,8 +232,9 @@ impl Handshake {
 
     /// The fatal (or encrypted) alert that ended the handshake, if any.
     pub fn failure(&self) -> Option<&AlertSeen> {
-        let before = |a: &&AlertSeen| self.finished.is_none_or(|f| a.arrival.frame <= f.frame);
-        self.alerts.iter().filter(before).find(|a| a.may_be_fatal())
+        self.alerts
+            .iter()
+            .find(|a| a.during_handshake && a.may_be_fatal())
     }
 
     /// Seconds from the ClientHello to the ServerHello.
@@ -505,7 +510,7 @@ fn record(
     events: &mut Vec<TlsEvent>,
 ) {
     let own = side_index(side);
-    let tls13 = handshake.version() == Some(tls::TLS_1_3);
+    let tls13 = handshake.version().is_some_and(tls::is_tls13);
     match content_type {
         // Before TLS 1.3, ChangeCipherSpec switches that side to encryption.
         // TLS 1.3 sends dummy ones for middlebox compatibility, even before
@@ -523,6 +528,7 @@ fn record(
                 from: side,
                 arrival: at,
                 alert,
+                during_handshake: handshake.finished.is_none(),
             });
             events.push(TlsEvent::Alert(alert));
         }
@@ -554,6 +560,7 @@ fn record(
                     from: side,
                     arrival: at,
                     alert: None,
+                    during_handshake: true,
                 });
                 events.push(TlsEvent::Alert(None));
             } else {
@@ -591,7 +598,7 @@ fn handshake_message(
                 if hello.hello_retry_request {
                     handshake.hello_retry = true;
                 } else {
-                    if hello.version() == tls::TLS_1_3 {
+                    if tls::is_tls13(hello.version()) {
                         // Everything after the ServerHello is encrypted.
                         dirs[0].encrypted = true;
                         dirs[1].encrypted = true;

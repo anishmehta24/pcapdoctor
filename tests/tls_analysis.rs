@@ -111,7 +111,7 @@ fn every_frame_matches_tshark() {
         }
         compared += 1;
     }
-    assert_eq!(compared, 53);
+    assert_eq!(compared, 62);
 }
 
 #[test]
@@ -189,6 +189,12 @@ fn results_and_problems() {
         vec![TlsProblem::OldVersion(0x0301)]
     );
 
+    // A TLS 1.3 draft is TLS 1.3: the client's encrypted Finished ends it.
+    assert_eq!(result("draft.example"), TlsResult::Completed);
+    // Finished and an encrypted close_notify in the same packet.
+    assert_eq!(result("coalesced.example"), TlsResult::Completed);
+    assert!(problems(&analyzer, "coalesced.example").is_empty());
+
     // The ClientHello was split over records and segments; *.wild.example covers it.
     assert_eq!(result("api.wild.example"), TlsResult::Completed);
     assert!(problems(&analyzer, "api.wild.example").is_empty());
@@ -197,7 +203,7 @@ fn results_and_problems() {
 #[test]
 fn plain_http_on_443_is_not_tls() {
     let (analyzer, _, _) = analyze();
-    assert_eq!(analyzer.tls.handshakes().len(), 14);
+    assert_eq!(analyzer.tls.handshakes().len(), 16);
     let plain = analyzer
         .flows
         .flows()
@@ -232,7 +238,7 @@ fn servers_are_named_by_what_the_client_asked_for() {
     assert_eq!(analyzer.name_of(ip("10.1.14.20")), Some("api.wild.example"));
 
     let report = stats::render(&stats, &analyzer, 20);
-    assert!(report.contains("TLS: 14 handshakes\n"), "{report}");
+    assert!(report.contains("TLS: 16 handshakes\n"), "{report}");
     for expected in [
         "client rejected the handshake: certificate_expired (a certificate has expired or is not valid yet)",
         "certificate is for other.example, not wrong.example",

@@ -287,6 +287,25 @@ def build():
     c.at(20).s(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
     c.close()
 
+    # 16. A TLS 1.3 draft (23): everything after the ServerHello is encrypted.
+    c = Conn(frames, 16).open()
+    c.c(record(HANDSHAKE, client_hello("draft.example", ["h2"], [0x7f17, TLS12])))
+    c.at(20).s(record(HANDSHAKE, server_hello(selected=0x7f17)) + encrypted(APPDATA, 1900))
+    c.at(1).c(encrypted(APPDATA, 53)).at(0.1).c(encrypted(APPDATA, 300))
+    c.at(25).s(encrypted(APPDATA, 800))
+    c.close()
+
+    # 17. TLS 1.2 where the server sends its Finished and an encrypted
+    #     close_notify in one packet: still a completed handshake.
+    c = Conn(frames, 17).open()
+    c.c(record(HANDSHAKE, client_hello("coalesced.example", ["http/1.1"])))
+    c.at(20).s(record(HANDSHAKE, server_hello() + certificate(certs.leaf(
+        "coalesced.example", ["coalesced.example"])) + SERVER_HELLO_DONE))
+    c.at(1).c(record(HANDSHAKE, handshake(16, os.urandom(66))) + record(CCS, b"\x01")
+              + encrypted(HANDSHAKE, 40))
+    c.at(20).s(record(CCS, b"\x01") + encrypted(HANDSHAKE, 40) + encrypted(ALERT, 26))
+    c.close()
+
     frames.sort(key=lambda f: f[0])
     return frames
 

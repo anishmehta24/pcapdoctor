@@ -16,6 +16,11 @@ pub const CERTIFICATE: u8 = 11;
 
 pub const TLS_1_3: u16 = 0x0304;
 
+/// TLS 1.3, or one of the drafts (0x7fxx) used before it was final.
+pub fn is_tls13(version: u16) -> bool {
+    version == TLS_1_3 || (0x7f00..=0x7fff).contains(&version)
+}
+
 /// Largest record payload allowed: 2^14 plus room for compression and
 /// encryption overhead (RFC 5246 section 6.2.3).
 pub const MAX_RECORD_LEN: usize = 16_384 + 2048;
@@ -487,6 +492,7 @@ mod tests {
     fn grease_and_names() {
         assert!(is_grease(0x0a0a) && is_grease(0xfafa) && !is_grease(0x0303));
         assert_eq!(version_name(0x7f14), "TLS 1.3 draft 20");
+        assert!(is_tls13(0x0304) && is_tls13(0x7f17) && !is_tls13(0x0303));
         assert_eq!(alert_name(48), "unknown_ca");
         assert_eq!(printable(b"a\nb"), "a\\nb");
     }
