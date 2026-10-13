@@ -83,6 +83,20 @@ pub fn utc(ts: Timestamp) -> String {
     )
 }
 
+/// "2026-10-13T09:41:07.250000Z"
+pub fn rfc3339(ts: Timestamp) -> String {
+    let secs = ts.0 / 1_000_000_000;
+    let micros = ts.0 % 1_000_000_000 / 1_000;
+    let (year, month, day) = civil_from_days(secs / 86_400);
+    let rem = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{micros:06}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 /// Days since 1970-01-01 to (year, month, day), from Howard Hinnant's
 /// `civil_from_days`: <https://howardhinnant.github.io/date_algorithms.html>
 fn civil_from_days(days: u64) -> (u64, u64, u64) {

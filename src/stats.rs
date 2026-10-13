@@ -13,7 +13,7 @@ use crate::analyze::tls::{Handshake, TlsResult};
 use crate::capture::{Frame, Timestamp};
 use crate::decode::dns as dns_wire;
 use crate::decode::tls as tls_wire;
-use crate::decode::{Link, Network, Packet, Transport};
+use crate::decode::{Link, Network, Packet, Problem, Transport};
 use crate::flow::{Counter, Flow, FlowTable, ResetKind, Side, TcpConn, TcpStatus};
 use crate::names;
 use crate::units::{self, Align, Table};
@@ -26,6 +26,30 @@ pub struct Stats {
     /// Protocol hierarchy; the root itself is unnamed.
     pub protocols: ProtocolNode,
     pub hosts: HashMap<IpAddr, Host>,
+    /// Packets the capture kept only the start of.
+    pub snapped: Sample,
+    /// The most bytes kept of a snapped packet: the capture's length limit.
+    pub snaplen: u32,
+    /// Packets that could not be decoded, as opposed to merely cut short.
+    pub malformed: Sample,
+}
+
+/// Packets of one kind: how many, and the first few frame numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sample {
+    pub count: u64,
+    pub frames: Vec<u64>,
+}
+
+impl Sample {
+    const KEEP: usize = 10;
+
+    fn add(&mut self, frame: u64) {
+        self.count += 1;
+        if self.frames.len() < Self::KEEP {
+            self.frames.push(frame);
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +107,18 @@ impl Stats {
         if let Some((src, dst)) = pkt.network.as_ref().and_then(Network::ip_addrs) {
             self.hosts.entry(src).or_default().sent.add(bytes);
             self.hosts.entry(dst).or_default().received.add(bytes);
+        }
+        let kept = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
+        if kept < frame.orig_len {
+            self.snapped.add(frame.number);
+            self.snaplen = self.snaplen.max(kept);
+        }
+        if pkt
+            .error
+            .as_ref()
+            .is_some_and(|e| e.problem != Problem::CutShort)
+        {
+            self.malformed.add(frame.number);
         }
     }
 

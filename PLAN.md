@@ -5,14 +5,20 @@
 `pcapdoctor capture.pcap` says what went wrong on the network in plain English, and names the frames to look at in Wireshark.
 
 ```
-$ pcapdoctor capture.pcap
-✗ DNS   api.internal: NXDOMAIN (3 queries)                                frames 12, 40, 41
-✗ TLS   pay.example.com: handshake failed, server sent unknown_ca         frame 88
-⚠ SLOW  api.example.com:443: network RTT 40 ms, server took 2.1 s         frames 101-140
+$ pcapdoctor examples/demo.pcap
+examples/demo.pcap: 314 packets over 8.19 s, from 2025-10-09 08:53:20.000 UTC
+
+✗ DNS   api.internal: name does not exist (NXDOMAIN, asked 3 times)             frames 41-42, 134
+✗ TLS   pay.example.com:443: client rejected the handshake: unknown_ca (the certificate's issuer is not trusted)  frame 84
+        → usually a private CA, or a TLS-inspecting proxy whose CA the client does not have
+⚠ SLOW  api.example.com:443: network RTT 40.0 ms, server took 2.10 s to answer  frames 114-166
         → the server is slow, not the network
-⚠ LOSS  10.0.0.5 → cdn.example.com:443: 6% of segments retransmitted      frames 210-480
-✓ 214 other connections look healthy
+⚠ LOSS  10.0.0.5 → cdn.example.com:443: 7.4% of segments retransmitted (4 of 54), mostly by the server  frames 206-261
+        → the capture saw the first copies, so packets were lost between the capture point and the client
+✓ 11 other connections look healthy
 ```
+
+That is real output, from [`examples/demo.pcap`](examples/demo.pcap): a generated capture of a laptop browsing for ten seconds (see `examples/gen_demo.py`).
 
 Who it's for: support engineers handed a customer's capture, backend developers chasing "it's slow" or "it fails sometimes", and CI pipelines that should fail on network errors. None of them should need to know Wireshark.
 
@@ -31,7 +37,7 @@ Who it's for: support engineers handed a customer's capture, backend developers 
 | `pcapdoctor dump FILE [-c N]` | one line per packet, like tcpdump | M1 |
 | `pcapdoctor dump FILE -f FILTER` | same, filtered | M7 |
 | `pcapdoctor stats FILE [-n N]` | protocol mix, busiest hosts, conversations | M2 |
-| `pcapdoctor FILE [--format text\|json\|html]` | diagnosis report (default command) | M6 |
+| `pcapdoctor FILE [--format text\|json\|html] [-o PATH] [--all]` | diagnosis report (default command) | M6 |
 | `pcapdoctor check FILE --fail-on FILTER` | CI mode: exit 1 when something matches | M7 |
 | `pcapdoctor live -i IFACE -d 30s` | capture, then diagnose | M8 |
 
@@ -43,7 +49,8 @@ Exit codes: 0 ok, 1 `check` found problems, 2 error.
 capture/   pcap + pcapng readers, our own code (no libpcap)    -> Frame { number, ts, link_type, data }
 decode/    link -> IPv4/IPv6/ARP -> TCP/UDP/ICMP                -> Packet { layers, error }
 flow/      bidirectional 5-tuple table, TCP state per flow      (M2)
-analyze/   TCP health, DNS, TLS, HTTP detectors                  -> Finding { severity, text, frames, metrics }  (M3-M5)
+analyze/   TCP health, DNS, TLS, HTTP detectors                  (M3-M5)
+diagnose/  rules over the analysis                               -> Finding { severity, category, text, frames, measurements, filter }  (M6)
 report/    text / JSON / HTML                                    (M6)
 filter/    tokenizer -> parser -> AST -> evaluator               (M7)
 ```
@@ -119,12 +126,32 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
   - On a real HTTPS capture that tshark can decrypt with its embedded keys, the largest wait came out at 158.6 ms. tshark's per-request times are 156–164 ms.
   - Not covered: per-request timing inside HTTP/2 and HTTP/3, which need decryption.
 
-### M6 Diagnosis and report
+### M6 Diagnosis and report — done 2026-10-14
 - Finding: severity (error, warning, info), category, one sentence, evidence frames, measurements
 - Rules turn M3–M5 data into findings; everything else rolls up into a health summary
 - Output: colored text (default), JSON (versioned schema), HTML (one self-contained file)
 - `pcapdoctor FILE` becomes the default command
 - **Done when:** the example at the top of this file is real output from a capture committed to the repo.
+- **Status:**
+  - The example at the top is the report for `examples/demo.pcap`, and a test keeps it that way. tshark agrees on everything it points at: the NXDOMAIN responses, the unknown_ca alert, the 40 ms round trip, and the four fast retransmissions.
+  - Every finding carries a Wireshark display filter. Across all 49 test captures, each filter parses in tshark 4.6 and matches the frames its finding names.
+  - Findings are grouped: one per name, server or client-and-server pair, not one per packet. Errors come first, then warnings and notes, each in capture order.
+  - Rules and their thresholds:
+    - DNS: error codes by name; servers that never answer or can't be reached; lookups slower than 500 ms or sent again.
+    - TCP: refused and unanswered connection attempts by server, after 3 s. One client trying 10 or more ports on a server is reported as a likely port scan, not as failures.
+    - TCP: connections reset by the server while open; a connect that needed a second SYN (500 ms beyond the round trip).
+    - Loss: at least 3 retransmissions and 2% of segments between a client and server; an error from 10 retransmissions and 10%. It says who resent, and whether the capture saw the first copies, which places the loss before or after the capture point.
+    - Slow servers: HTTP responses whose server time is over 500 ms. For connections it can't read into (mostly encrypted ones), a wait over 1 s beyond the network's part. Interactive ports (SSH, telnet, RDP, VNC) are skipped. A round trip of 250 ms or more gets a note.
+    - TLS: the problems from M5, with a certificate problem the client rejected written as cause and effect.
+    - HTTP: 5xx as errors, 4xx as warnings, and requests with no response, with what happened to the connection.
+    - Receivers out of buffer (zero window). A sender filling the window 5 or more times gets a note.
+    - The capture itself: cut-off files, packets cut short by a snaplen, packets that couldn't be decoded, packets the capture missed, and connections captured in one direction only.
+  - Heuristics that keep noise down:
+    - A failed lookup of a name with a search domain added (`api.example.com.corp.local` next to `api.example.com`) is the resolver at work, and isn't reported.
+    - A missing reverse name is a note; a missing service record (`_ldap._tcp...`) is a warning.
+    - A client resetting connections is a note, since applications often close that way.
+    - A reset already explained by a TLS or HTTP failure isn't reported again.
+    - On connections captured in one direction only, missing answers aren't reported: they may have been sent.
 
 ### M7 Filter language and CI mode
 - Wireshark-style syntax: `tcp.port == 443 && !(ip.src == 10.0.0.0/8)`, `dns.rcode != 0`, `tcp.flags.rst`, `tls.sni contains "api"`

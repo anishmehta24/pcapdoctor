@@ -2,9 +2,40 @@
 
 Reads a packet capture and tells you what went wrong on the network, in plain English: failed DNS lookups, refused or reset connections, packet loss, TLS handshake failures, and whether a slow request was the network's fault or the server's.
 
-**Status: early.** Packet listing, conversation summaries, TCP analysis (retransmissions, duplicate ACKs, zero windows, resets, round-trip times) DNS analysis (failed, missing, slow and retried lookups) TLS analysis (rejected handshakes, certificate problems, slow servers) and HTTP analysis (status codes, and how long the server took) work. The plain-English diagnosis report is next; see [PLAN.md](PLAN.md).
+```
+$ pcapdoctor examples/demo.pcap
+examples/demo.pcap: 314 packets over 8.19 s, from 2025-10-09 08:53:20.000 UTC
+
+✗ DNS   api.internal: name does not exist (NXDOMAIN, asked 3 times)             frames 41-42, 134
+✗ TLS   pay.example.com:443: client rejected the handshake: unknown_ca (the certificate's issuer is not trusted)  frame 84
+        → usually a private CA, or a TLS-inspecting proxy whose CA the client does not have
+⚠ SLOW  api.example.com:443: network RTT 40.0 ms, server took 2.10 s to answer  frames 114-166
+        → the server is slow, not the network
+⚠ LOSS  10.0.0.5 → cdn.example.com:443: 7.4% of segments retransmitted (4 of 54), mostly by the server  frames 206-261
+        → the capture saw the first copies, so packets were lost between the capture point and the client
+✓ 11 other connections look healthy
+```
+
+**Status: early.** The diagnosis report works, along with packet listing (`dump`) and capture summaries (`stats`). A filter language and a CI check mode are next; see [PLAN.md](PLAN.md).
 
 ## Usage
+
+`pcapdoctor FILE` prints the report above. Each finding is one sentence and the frames to look at in Wireshark. When the numbers point one way, a second line says what it most likely means. ✗ marks something that failed, ⚠ something degraded (slow, lossy, or failing some of the time), and • a note. [`examples/demo.pcap`](examples/demo.pcap) is a generated capture of a laptop browsing for ten seconds, to try it on.
+
+It looks for:
+- DNS: names that don't exist, server failures and refusals, servers that don't answer or can't be reached, slow and retried lookups
+- TCP: refused and unanswered connections, connections the server reset, connects that needed a second SYN, receivers that ran out of buffer
+- loss: how much was retransmitted, by whom, and whether it was lost before or after the capture point
+- slow servers: the network's round trip against the server's own time, for HTTP and for encrypted connections alike
+- TLS: rejected handshakes and why, certificate problems (expired, wrong name, self-signed), outdated versions, slow servers
+- HTTP: error responses, and requests that never got one
+- the capture itself: cut-off files, packets cut short, one-sided captures, and packets the capture missed
+
+Options:
+- `--format json`: for scripts. Each finding has its severity, frames, measurements, and a Wireshark filter that shows it. `schema` goes up when a field changes.
+- `--format html -o report.html`: one self-contained page to attach to a ticket.
+- `--all`: show every finding; text output stops after 30.
+- `--color auto|always|never`: `NO_COLOR` is respected.
 
 `dump` prints one line per packet:
 
