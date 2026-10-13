@@ -1,12 +1,15 @@
 //! Capture-wide numbers for `pcapdoctor stats`: protocol mix, busiest hosts
 //! and conversations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::net::IpAddr;
 
+use crate::analyze::Analyzer;
+use crate::analyze::dns::{DnsLog, Lookup, Outcome, SLOW_SECS};
 use crate::analyze::tcp::TcpHealth;
 use crate::capture::{Frame, Timestamp};
+use crate::decode::dns as dns_wire;
 use crate::decode::{Link, Network, Packet, Transport};
 use crate::flow::{Counter, Flow, FlowTable, ResetKind, Side, TcpConn, TcpStatus};
 use crate::names;
@@ -137,7 +140,8 @@ fn protocol_path(pkt: &Packet<'_>) -> Vec<String> {
 }
 
 /// Text report for `pcapdoctor stats`; tables show at most `top` rows.
-pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
+pub fn render(stats: &Stats, analyzer: &Analyzer, top: usize) -> String {
+    let (flows, dns) = (&analyzer.flows, &analyzer.dns);
     let mut out = String::new();
     let duration = stats.duration_secs();
     let _ = writeln!(out, "Packets   {}", units::count(stats.total.packets));
@@ -167,21 +171,31 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
 
     let hosts = stats.busiest_hosts();
     if !hosts.is_empty() {
-        let mut table = Table::new(&[
-            ("Host", Align::Left),
+        let shown = &hosts[..hosts.len().min(top)];
+        let named = shown.iter().any(|(ip, _)| dns.name_of(*ip).is_some());
+        let mut columns = vec![("Host", Align::Left)];
+        if named {
+            columns.push(("Name", Align::Left));
+        }
+        columns.extend([
             ("Packets sent", Align::Right),
             ("Bytes sent", Align::Right),
             ("Packets received", Align::Right),
             ("Bytes received", Align::Right),
         ]);
-        for (ip, host) in hosts.iter().take(top) {
-            table.row(vec![
-                ip.to_string(),
+        let mut table = Table::new(&columns);
+        for (ip, host) in shown {
+            let mut row = vec![ip.to_string()];
+            if named {
+                row.push(dns.name_of(*ip).unwrap_or("").to_string());
+            }
+            row.extend([
                 units::count(host.sent.packets),
                 units::bytes(host.sent.bytes),
                 units::count(host.received.packets),
                 units::bytes(host.received.bytes),
             ]);
+            table.row(row);
         }
         let _ = write!(
             out,
@@ -205,15 +219,24 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
                 .cmp(&a.bytes())
                 .then_with(|| a.stream.cmp(&b.stream))
         });
+        let named = list
+            .iter()
+            .take(top)
+            .any(|f| dns.name_of(f.server.ip()).is_some());
         let mut columns = vec![
             ("Stream", Align::Right),
             ("Client", Align::Left),
             ("Server", Align::Left),
+        ];
+        if named {
+            columns.push(("Server name", Align::Left));
+        }
+        columns.extend([
             ("Packets", Align::Right),
             ("Client→Server", Align::Right),
             ("Server→Client", Align::Right),
             ("Duration", Align::Right),
-        ];
+        ]);
         if tcp {
             columns.push(("RTT", Align::Right));
             columns.push(("Retrans", Align::Right));
@@ -226,11 +249,16 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
                 flow.stream.to_string(),
                 flow.client.to_string(),
                 flow.server.to_string(),
+            ];
+            if named {
+                row.push(dns.name_of(flow.server.ip()).unwrap_or("").to_string());
+            }
+            row.extend([
                 units::count(flow.packets()),
                 units::bytes(flow.from_client.bytes),
                 units::bytes(flow.from_server.bytes),
                 units::duration(flow.duration_secs()),
-            ];
+            ]);
             if let Some(conn) = &flow.tcp {
                 row.push(
                     conn.handshake_rtt()
@@ -257,14 +285,137 @@ pub fn render(stats: &Stats, flows: &FlowTable, top: usize) -> String {
             let _ = writeln!(out, "* already open when the capture started");
         }
         if tcp {
-            let _ = write!(
-                out,
-                "
-{}",
-                tcp_problems(flows)
-            );
+            let _ = write!(out, "\n{}", tcp_problems(flows));
         }
     }
+    out.push_str(&dns_section(dns, top));
+    out
+}
+
+/// Outcomes of all DNS lookups, then the ones that went wrong.
+fn dns_section(log: &DnsLog, top: usize) -> String {
+    let lookups = log.lookups();
+    if lookups.is_empty() && log.unmatched_responses.is_empty() && log.malformed.is_empty() {
+        return String::new();
+    }
+    let end = log.capture_end();
+    let servers: HashSet<_> = lookups.iter().map(|l| l.server).collect();
+    let mut out = format!(
+        "\nDNS: {} lookup{} to {} server{}\n",
+        units::count(lookups.len() as u64),
+        if lookups.len() == 1 { "" } else { "s" },
+        servers.len(),
+        if servers.len() == 1 { "" } else { "s" }
+    );
+
+    let mut outcomes: BTreeMap<Outcome, u64> = BTreeMap::new();
+    for lookup in lookups {
+        *outcomes.entry(lookup.outcome(end)).or_default() += 1;
+    }
+    let mut latencies: Vec<f64> = lookups.iter().filter_map(Lookup::latency).collect();
+    latencies.sort_by(f64::total_cmp);
+    let mut table = Table::new(&[
+        ("Result", Align::Left),
+        ("Count", Align::Right),
+        ("", Align::Left),
+    ]);
+    // Answers first, then problems in order of how bad they are.
+    let routine = [Outcome::Answered, Outcome::NoData, Outcome::Truncated];
+    let rest = outcomes.keys().copied().filter(|o| !routine.contains(o));
+    for outcome in routine.into_iter().chain(rest) {
+        let Some(&n) = outcomes.get(&outcome) else {
+            continue;
+        };
+        let note = match outcome {
+            Outcome::Answered if !latencies.is_empty() => format!(
+                "response time: median {}, slowest {}",
+                units::duration(latencies[latencies.len() / 2]),
+                units::duration(latencies[latencies.len() - 1])
+            ),
+            _ => String::new(),
+        };
+        table.row(vec![outcome.to_string(), units::count(n), note]);
+    }
+    let retried = lookups.iter().filter(|l| !l.retries.is_empty()).count() as u64;
+    let slow = lookups.iter().filter(|l| l.is_slow()).count() as u64;
+    let extras = [
+        ("Retried", retried, "query sent more than once".to_string()),
+        (
+            "Slow",
+            slow,
+            format!("answered after more than {}", units::duration(SLOW_SECS)),
+        ),
+        (
+            "Query not captured",
+            log.unmatched_responses.len() as u64,
+            "response to a query sent before the capture began".to_string(),
+        ),
+        (
+            "Malformed",
+            log.malformed.len() as u64,
+            "port 53 packets that are not valid DNS".to_string(),
+        ),
+    ];
+    for (name, n, note) in extras {
+        if n > 0 {
+            table.row(vec![name.to_string(), units::count(n), note]);
+        }
+    }
+    out.push_str(&table.render());
+
+    let mut problems: Vec<&Lookup> = lookups
+        .iter()
+        .filter(|l| {
+            let bad = !matches!(
+                l.outcome(end),
+                Outcome::Answered | Outcome::NoData | Outcome::Truncated | Outcome::CaptureEnded
+            );
+            bad || l.is_slow() || !l.retries.is_empty()
+        })
+        .collect();
+    if problems.is_empty() {
+        return out;
+    }
+    problems.sort_by(|a, b| {
+        a.outcome(end)
+            .cmp(&b.outcome(end))
+            .then_with(|| {
+                b.latency()
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.latency().unwrap_or(0.0))
+            })
+            .then_with(|| a.query_frame.cmp(&b.query_frame))
+    });
+    let mut table = Table::new(&[
+        ("Name", Align::Left),
+        ("Type", Align::Left),
+        ("Server", Align::Left),
+        ("Result", Align::Left),
+        ("Time", Align::Right),
+        ("Sent", Align::Right),
+        ("Frame", Align::Right),
+    ]);
+    for lookup in problems.iter().take(top) {
+        let (name, qtype) = lookup.question.as_ref().map_or_else(
+            || ("?".to_string(), "?".to_string()),
+            |q| (q.name.clone(), dns_wire::type_name(q.qtype)),
+        );
+        table.row(vec![
+            name,
+            qtype,
+            lookup.server.to_string(),
+            lookup.outcome(end).to_string(),
+            lookup.latency().map_or("-".to_string(), units::duration),
+            (1 + lookup.retries.len()).to_string(),
+            lookup.query_frame.to_string(),
+        ]);
+    }
+    let _ = write!(
+        out,
+        "\n{}{}",
+        heading("Problem lookups", problems.len(), top, "worst first"),
+        table.render()
+    );
     out
 }
 
@@ -376,15 +527,9 @@ fn tcp_problems(flows: &FlowTable) -> String {
         }
     }
     if any {
-        format!(
-            "TCP problems
-{}",
-            table.render()
-        )
+        format!("TCP problems\n{}", table.render())
     } else {
-        "TCP problems: none found
-"
-        .to_string()
+        "TCP problems: none found\n".to_string()
     }
 }
 
