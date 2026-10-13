@@ -92,7 +92,7 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
   `tests/fixtures/dns-zoo.pcap` has one connection per case (error codes, no response, ICMP unreachable, retries, truncation then TCP, IPv6, malformed names), and tshark's view of it is committed.
   Not covered: multicast DNS and LLMNR (other ports), and encrypted DNS (DoH, DoT).
 
-### M5 TLS and HTTP — TLS done 2026-10-13, HTTP next
+### M5 TLS and HTTP — done 2026-10-13
 - TLS records and handshake: ClientHello SNI, ALPN, offered versions; ServerHello chosen version; alerts (handshake_failure, unknown_ca, certificate_expired, protocol_version, ...)
 - TLS 1.2 certificates: subject, issuer, expiry (TLS 1.3 encrypts them)
 - HTTP/1.x: request line, status code, per-request timing (reassemble the start of each request and response)
@@ -107,6 +107,17 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
     - An SSLv2-format ClientHello isn't supported.
     - In TLS 1.3 a 19-byte encrypted record before the client's Finished is read as an alert. That's a heuristic; tshark can't tell without keys.
   - Not covered yet: client certificates (mutual TLS), QUIC.
+- **HTTP status:**
+  - HTTP/1.x is recognized by content on any port.
+  - All the body rules are followed: length, chunked, until close, HEAD/1xx/204/304, pipelining, `100 Continue`, upgrades and CONNECT tunnels.
+  - Each response is matched to its request, with its time to first byte and server time. Server time is the time to first byte minus the capture-to-server round trip.
+  - TCP reassembly now holds segments that arrive ahead of a gap until it fills. That gives the same result as Wireshark with out-of-order reassembly on.
+  - Checked against tshark on `tests/fixtures/http-zoo.pcap`: every request and response matches on method, URI, host, status, and which request a response answers.
+- **Encrypted traffic:**
+  - Each TCP connection gets a "wait": from the client's last data to the start of the server's largest burst in reply. It needs no decryption.
+  - The largest burst skips the small things a server may send first (TLS 1.3 session tickets, HTTP/2 settings) or last (a close alert on an idle connection).
+  - On a real HTTPS capture that tshark can decrypt with its embedded keys, the largest wait came out at 158.6 ms. tshark's per-request times are 156–164 ms.
+  - Not covered: per-request timing inside HTTP/2 and HTTP/3, which need decryption.
 
 ### M6 Diagnosis and report
 - Finding: severity (error, warning, info), category, one sentence, evidence frames, measurements

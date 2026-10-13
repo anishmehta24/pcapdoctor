@@ -74,6 +74,9 @@ pub fn describe_with(
     for event in &found.tls {
         let _ = write!(line, " TLS {event}");
     }
+    for event in &found.http {
+        let _ = write!(line, " HTTP {event}");
+    }
     if has_dns && matches!(pkt.transport, Some(Transport::Tcp(_))) {
         let _ = write!(line, " DNS {}", dns_text());
     }

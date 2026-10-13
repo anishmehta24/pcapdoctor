@@ -14,6 +14,11 @@ use crate::capture::{Frame, Timestamp};
 use crate::decode::{IPPROTO_TCP, IPPROTO_UDP, Packet, Tcp, TcpFlags, Transport};
 use crate::summary::SeqBase;
 
+/// Burst-splitting silence when the round trip is unknown, and the least
+/// used when it is very short.
+const DEFAULT_QUIET_SECS: f64 = 0.2;
+const MIN_QUIET_SECS: f64 = 0.05;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Client,
@@ -100,6 +105,9 @@ pub struct TcpConn {
     last_syn_ts: Option<Timestamp>,
     /// From that SYN to the first SYN-ACK.
     syn_to_syn_ack_ns: Option<u64>,
+    /// The longest the client waited for the server; see `Wait`.
+    pub longest_wait: Option<Wait>,
+    waiting: WaitTracker,
     /// Sequence number that counts as 0, for the client and server directions.
     base_seq: [Option<u32>; 2],
 }
@@ -119,6 +127,46 @@ pub enum ResetKind {
     Aborted,
     /// Sent while closing, after a FIN. Usually harmless.
     WhileClosing,
+}
+
+/// How long a client waited for its server: from the client's last data to
+/// the start of the server's largest burst of data in reply.
+///
+/// The largest burst is almost always the real answer. A server may first
+/// send something small at once (a TLS 1.3 session ticket, HTTP/2 settings)
+/// or much later (a close alert when an idle connection times out), so the
+/// first or last server data would mislead. This needs no decryption, so it
+/// works for HTTPS. Bursts are split by silences longer than 1.5 round trips,
+/// so the ordinary pauses in a large download stay in one burst; a silence
+/// that ends in a retransmission, or while the client's window was closed, is
+/// the network's or the client's doing and splits nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wait {
+    /// The client's last data before the wait.
+    pub request_frame: u64,
+    /// The first frame of the server's largest burst in reply.
+    pub response_frame: u64,
+    pub secs: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WaitTracker {
+    /// End of the client's latest data: the request being answered.
+    since: Option<(u64, Timestamp)>,
+    /// The burst of server data now arriving.
+    burst: Option<Burst>,
+    /// Bytes in the largest burst so far in reply to this request.
+    largest: u64,
+    /// The client advertised a zero window since the last server data.
+    client_window_closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Burst {
+    frame: u64,
+    start: Timestamp,
+    last: Timestamp,
+    bytes: u64,
 }
 
 /// Handshake timing. The capture point splits the round trip in two: SYN to
@@ -210,6 +258,75 @@ impl TcpConn {
         })
     }
 
+    fn track_wait(&mut self, side: Side, tcp: &Tcp, frame: &Frame, events: &[TcpEvent]) {
+        let resent = events.iter().any(|e| {
+            matches!(
+                e,
+                TcpEvent::Retransmission
+                    | TcpEvent::FastRetransmission
+                    | TcpEvent::SpuriousRetransmission
+                    | TcpEvent::OutOfOrder
+            )
+        });
+        // A silence this long between server packets starts a new burst.
+        let quiet = self
+            .handshake_rtt()
+            .map_or(DEFAULT_QUIET_SECS, |r| (1.5 * r.total).max(MIN_QUIET_SECS));
+        let w = &mut self.waiting;
+        if side == Side::Client && events.contains(&TcpEvent::ZeroWindow) {
+            w.client_window_closed = true;
+        }
+        if tcp.payload_len == 0 {
+            return;
+        }
+        match side {
+            // Data sent again is not a new request.
+            Side::Client if resent => {}
+            Side::Client => {
+                *w = WaitTracker {
+                    since: Some((frame.number, frame.ts)),
+                    ..WaitTracker::default()
+                };
+            }
+            Side::Server => {
+                let Some((request_frame, request_ts)) = w.since else {
+                    return;
+                };
+                let new_burst = match &w.burst {
+                    None => true,
+                    Some(b) => {
+                        frame.ts.secs_since(b.last) > quiet && !resent && !w.client_window_closed
+                    }
+                };
+                if new_burst {
+                    w.burst = Some(Burst {
+                        frame: frame.number,
+                        start: frame.ts,
+                        last: frame.ts,
+                        bytes: 0,
+                    });
+                }
+                let burst = w.burst.as_mut().expect("set above");
+                burst.bytes += u64::from(tcp.payload_len);
+                burst.last = frame.ts;
+                w.client_window_closed = false;
+                if burst.bytes > w.largest {
+                    w.largest = burst.bytes;
+                    // Bursts come in time order, so a new largest one never
+                    // shortens the wait already recorded for this request.
+                    let secs = burst.start.secs_since(request_ts);
+                    if self.longest_wait.is_none_or(|l| secs > l.secs) {
+                        self.longest_wait = Some(Wait {
+                            request_frame,
+                            response_frame: burst.frame,
+                            secs,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// What to subtract from a segment sent by `side` to show relative numbers.
     pub fn seq_base(&self, side: Side) -> SeqBase {
         let (own, other) = indexes(side);
@@ -280,6 +397,7 @@ impl TcpConn {
         }
         let events = self.analyzer.segment(side, tcp, frame.number, frame.ts);
         self.health[own].record(tcp, frame.number, &events);
+        self.track_wait(side, tcp, frame, &events);
         events
     }
 }

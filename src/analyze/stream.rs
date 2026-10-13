@@ -1,10 +1,12 @@
 //! Puts one direction of a TCP connection back in order, for protocols whose
 //! messages span segments: DNS over TCP, TLS, HTTP.
 //!
-//! Only in-order data is used. A gap (a segment the capture missed) loses
-//! the message boundaries, so the direction is given up from there on.
+//! Segments that arrive ahead of a gap wait until the gap fills, as happens
+//! when a capture sees packets out of order. If it never fills (the capture
+//! missed a segment) and too much piles up, the message boundaries are lost
+//! and the direction is given up from there on.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::capture::Timestamp;
 use crate::decode::{Tcp, TcpFlags};
@@ -15,6 +17,9 @@ pub struct Arrival {
     pub frame: u64,
     pub ts: Timestamp,
 }
+
+/// Most segments held waiting for a gap to fill.
+const MAX_EARLY_SEGMENTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum State {
@@ -35,6 +40,10 @@ pub struct Reassembler {
     /// For each buffered segment: the stream offset just past it, and when
     /// it arrived. Oldest first.
     arrivals: VecDeque<(u64, Arrival)>,
+    /// Segments that arrived ahead of a gap, by the stream offset where they
+    /// start.
+    early: BTreeMap<u64, Vec<u8>>,
+    early_bytes: usize,
     state: State,
 }
 
@@ -64,21 +73,58 @@ impl Reassembler {
         let next = *self.next_seq.get_or_insert(seq);
         let overlap = next.wrapping_sub(seq) as i32;
         if overlap < 0 {
-            self.lose();
+            // Ahead of a gap: hold it until the gap fills.
+            let full = self.early.len() >= MAX_EARLY_SEGMENTS
+                || self.buf.len() + self.early_bytes + payload.len() > limit;
+            if full {
+                self.lose();
+            } else {
+                let offset = self.end() + u64::from(overlap.unsigned_abs());
+                if let std::collections::btree_map::Entry::Vacant(slot) = self.early.entry(offset) {
+                    self.early_bytes += payload.len();
+                    slot.insert(payload.to_vec());
+                }
+            }
             return 0;
         }
         let Some(new) = payload.get(overlap as usize..).filter(|d| !d.is_empty()) else {
             return 0; // a retransmission of data we already have
         };
-        if self.buf.len() + new.len() > limit {
+        if self.buf.len() + self.early_bytes + new.len() > limit {
             self.lose();
             return 0;
         }
-        self.buf.extend_from_slice(new);
-        self.next_seq = Some(next.wrapping_add(new.len() as u32));
-        self.arrivals
-            .push_back((self.start + self.buf.len() as u64, at));
-        new.len()
+        let mut added = self.append(new, at);
+        // Early segments that now line up. Their bytes count as arriving now,
+        // when they became readable in order.
+        while let Some((&offset, _)) = self.early.first_key_value() {
+            let end = self.end();
+            if offset > end {
+                break;
+            }
+            let (_, data) = self.early.pop_first().expect("checked above");
+            self.early_bytes -= data.len();
+            if let Some(rest) = data
+                .get((end - offset) as usize..)
+                .filter(|d| !d.is_empty())
+            {
+                added += self.append(rest, at);
+            }
+        }
+        added
+    }
+
+    /// Stream offset just past the last byte received in order.
+    fn end(&self) -> u64 {
+        self.start + self.buf.len() as u64
+    }
+
+    fn append(&mut self, data: &[u8], at: Arrival) -> usize {
+        self.buf.extend_from_slice(data);
+        let next = self.next_seq.expect("set before appending");
+        self.next_seq = Some(next.wrapping_add(data.len() as u32));
+        self.arrivals.push_back((self.end(), at));
+        data.len()
     }
 
     /// Bytes received in order and not yet consumed.
@@ -139,6 +185,8 @@ impl Reassembler {
     fn release(&mut self) {
         self.buf = Vec::new();
         self.arrivals.clear();
+        self.early.clear();
+        self.early_bytes = 0;
     }
 }
 
@@ -203,15 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn gaps_cuts_and_limits_lose_the_stream() {
+    fn out_of_order_segments_wait_for_the_gap() {
+        let mut r = Reassembler::default();
+        r.push(&segment(0, TcpFlags::ACK, 2), b"ab", at(1), 100);
+        // Two segments arrive ahead of the one carrying "cd".
+        assert_eq!(r.push(&segment(6, TcpFlags::ACK, 2), b"gh", at(2), 100), 0);
+        assert_eq!(r.push(&segment(4, TcpFlags::ACK, 3), b"efg", at(3), 100), 0);
+        assert_eq!(r.data(), b"ab");
+        assert_eq!(r.push(&segment(2, TcpFlags::ACK, 2), b"cd", at(4), 100), 6);
+        assert_eq!(r.data(), b"abcdefgh");
+        // Released bytes count from the packet that filled the gap.
+        assert_eq!(r.arrival(7), Some(at(4)));
+    }
+
+    #[test]
+    fn gaps_that_never_fill_cuts_and_limits_lose_the_stream() {
         let mut gap = Reassembler::default();
-        gap.push(&segment(0, TcpFlags::ACK, 2), b"ab", at(1), 100);
-        gap.push(&segment(10, TcpFlags::ACK, 2), b"cd", at(2), 100);
+        gap.push(&segment(0, TcpFlags::ACK, 2), b"ab", at(1), 10);
+        for i in 0..3 {
+            gap.push(&segment(10 + 3 * i, TcpFlags::ACK, 3), b"xyz", at(2), 10);
+        }
         assert!(gap.lost_data());
-        assert_eq!(
-            gap.push(&segment(2, TcpFlags::ACK, 2), b"ef", at(3), 100),
-            0
-        );
+        assert_eq!(gap.push(&segment(2, TcpFlags::ACK, 2), b"ef", at(3), 10), 0);
 
         let mut cut = Reassembler::default();
         cut.push(
