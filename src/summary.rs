@@ -71,6 +71,9 @@ pub fn describe_with(
     for event in found.flow.iter().flat_map(|o| &o.tcp_events) {
         let _ = write!(line, " [{event}]");
     }
+    for event in &found.tls {
+        let _ = write!(line, " TLS {event}");
+    }
     if has_dns && matches!(pkt.transport, Some(Transport::Tcp(_))) {
         let _ = write!(line, " DNS {}", dns_text());
     }

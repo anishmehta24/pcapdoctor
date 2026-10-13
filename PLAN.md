@@ -92,11 +92,21 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
   `tests/fixtures/dns-zoo.pcap` has one connection per case (error codes, no response, ICMP unreachable, retries, truncation then TCP, IPv6, malformed names), and tshark's view of it is committed.
   Not covered: multicast DNS and LLMNR (other ports), and encrypted DNS (DoH, DoT).
 
-### M5 TLS and HTTP
+### M5 TLS and HTTP — TLS done 2026-10-13, HTTP next
 - TLS records and handshake: ClientHello SNI, ALPN, offered versions; ServerHello chosen version; alerts (handshake_failure, unknown_ca, certificate_expired, protocol_version, ...)
 - TLS 1.2 certificates: subject, issuer, expiry (TLS 1.3 encrypts them)
 - HTTP/1.x: request line, status code, per-request timing (reassemble the start of each request and response)
 - **Network or server?** Server time ≈ time to first response byte − RTT
+- **TLS status:**
+  - TLS is recognized by content, so any port works and plain HTTP on 443 is not mistaken for it.
+  - Covers hellos (including HelloRetryRequest and pre-standard TLS 1.3 drafts), certificate chains up to TLS 1.2 (own DER reader: names, issuer, validity), plaintext and encrypted alerts, and handshake completion.
+  - Problems found: rejected handshakes with the alert's meaning; no ServerHello (reset, closed or no answer); expired, not-yet-valid, wrong-name and self-signed certificates; outdated versions; and a slow ServerHello net of the network round trip.
+  - Checked against tshark on 1,138 TLS events across all test captures. `tests/fixtures/tls-zoo.pcap` has 15 cases with real certificates from a test CA, and tshark's view of it is committed.
+  - Differences, all expected:
+    - tshark decrypts captures that embed their keys; we don't.
+    - An SSLv2-format ClientHello isn't supported.
+    - In TLS 1.3 a 19-byte encrypted record before the client's Finished is read as an alert. That's a heuristic; tshark can't tell without keys.
+  - Not covered yet: client certificates (mutual TLS), QUIC.
 
 ### M6 Diagnosis and report
 - Finding: severity (error, warning, info), category, one sentence, evidence frames, measurements
