@@ -49,9 +49,12 @@ pub fn describe_with(
         if let Some(err) = &dns.error {
             parts.push(format!("[{err}]"));
         }
+        if dns.cut_short {
+            parts.push("[cut off by capture length limit]".to_string());
+        }
         parts.join("; ")
     };
-    let has_dns = !dns.messages.is_empty() || dns.error.is_some();
+    let has_dns = !dns.messages.is_empty() || dns.error.is_some() || dns.cut_short;
     let mut line = match (
         &pkt.transport,
         pkt.network.as_ref().and_then(Network::ip_addrs),

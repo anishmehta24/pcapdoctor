@@ -251,3 +251,33 @@ fn mutated_packets_never_panic() {
         let _ = stats::render(&Stats::default(), &analyzer, 10);
     }
 }
+
+/// A response cut off by the capture's length limit is incomplete, not
+/// malformed: with the header present it still matches its query, and the
+/// header's answer count says it was answered.
+#[test]
+fn responses_cut_by_snaplen_are_not_malformed() {
+    let mut capture = Capture::open(&Path::new(FIXTURES).join("dns-zoo.pcap")).unwrap();
+    let query = capture.next_frame().unwrap().unwrap();
+    let response = capture.next_frame().unwrap().unwrap();
+    // Ethernet + IPv4 + UDP is 42 bytes, then the 12-byte DNS header.
+    for (keep, matched) in [(80, true), (60, true), (50, false)] {
+        let mut cut = response.clone();
+        cut.data.truncate(keep);
+        let mut analyzer = Analyzer::new();
+        analyzer.observe(&query, &decode::decode(&query));
+        let pkt = decode::decode(&cut);
+        let found = analyzer.observe(&cut, &pkt);
+        assert!(analyzer.dns.malformed.is_empty(), "keep {keep}");
+        let line = pcapdoctor::summary::describe_with(&pkt, &found, None);
+        assert!(line.contains("[cut off by capture length limit]"), "{line}");
+        let lookup = &analyzer.dns.lookups()[0];
+        assert_eq!(lookup.response.is_some(), matched, "keep {keep}");
+        if matched {
+            assert_eq!(
+                lookup.outcome(analyzer.dns.capture_end()),
+                Outcome::Answered
+            );
+        }
+    }
+}

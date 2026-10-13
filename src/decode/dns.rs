@@ -42,6 +42,9 @@ pub struct Message {
     pub rcode: u8,
     pub questions: Vec<Question>,
     pub answers: Vec<Record>,
+    /// Answer count from the header. More than `answers.len()` when the
+    /// answers are damaged or were cut off by the capture.
+    pub answer_count: u16,
     pub authority_count: u16,
     pub additional_count: u16,
     /// Set when the answer section is damaged; the header and questions are
@@ -98,6 +101,25 @@ fn error(msg: impl Into<String>) -> DnsError {
 /// Parses one message. Fails if the header or questions are damaged; damage
 /// in the answers is reported in `Message::error` instead.
 pub fn parse(data: &[u8]) -> Result<Message, DnsError> {
+    match parse_parts(data)? {
+        (msg, None) => Ok(msg),
+        (_, Some(question_error)) => Err(question_error),
+    }
+}
+
+/// For a message the capture cut short: keeps whatever came before the cut,
+/// with the damage in `Message::error`. Needs at least the 12-byte header.
+pub fn parse_partial(data: &[u8]) -> Option<Message> {
+    let (mut msg, question_error) = parse_parts(data).ok()?;
+    if question_error.is_some() {
+        msg.error = question_error;
+    }
+    Some(msg)
+}
+
+/// Parses the header (or fails), then as many questions and answers as
+/// possible. Returns the error that stopped the questions, if any.
+fn parse_parts(data: &[u8]) -> Result<(Message, Option<DnsError>), DnsError> {
     if data.len() < 12 {
         return Err(error(format!(
             "{} bytes is shorter than the 12-byte header",
@@ -116,25 +138,22 @@ pub fn parse(data: &[u8]) -> Result<Message, DnsError> {
         rcode: (flags & 0x000f) as u8,
         questions: Vec::new(),
         answers: Vec::new(),
+        answer_count: be16(data, 6),
         authority_count: be16(data, 8),
         additional_count: be16(data, 10),
         error: None,
     };
-    let (question_count, answer_count) = (be16(data, 4), be16(data, 6));
     let mut pos = 12;
-    for _ in 0..question_count {
-        let (name, next) = read_name(data, pos)?;
-        let fixed = data
-            .get(next..next + 4)
-            .ok_or_else(|| error("question ends early"))?;
-        msg.questions.push(Question {
-            name,
-            qtype: be16(fixed, 0),
-            qclass: be16(fixed, 2),
-        });
-        pos = next + 4;
+    for _ in 0..be16(data, 4) {
+        match read_question(data, pos) {
+            Ok((question, next)) => {
+                msg.questions.push(question);
+                pos = next;
+            }
+            Err(e) => return Ok((msg, Some(e))),
+        }
     }
-    for _ in 0..answer_count {
+    for _ in 0..msg.answer_count {
         match read_record(data, pos) {
             Ok((record, next)) => {
                 msg.answers.push(record);
@@ -146,7 +165,20 @@ pub fn parse(data: &[u8]) -> Result<Message, DnsError> {
             }
         }
     }
-    Ok(msg)
+    Ok((msg, None))
+}
+
+fn read_question(data: &[u8], pos: usize) -> Result<(Question, usize), DnsError> {
+    let (name, next) = read_name(data, pos)?;
+    let fixed = data
+        .get(next..next + 4)
+        .ok_or_else(|| error("question ends early"))?;
+    let question = Question {
+        name,
+        qtype: be16(fixed, 0),
+        qclass: be16(fixed, 2),
+    };
+    Ok((question, next + 4))
 }
 
 fn read_record(data: &[u8], pos: usize) -> Result<(Record, usize), DnsError> {

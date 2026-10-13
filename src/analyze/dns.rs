@@ -48,6 +48,8 @@ pub struct Response {
     pub truncated: bool,
     /// The answers could not be read.
     pub malformed: bool,
+    /// From the header, so it is right even when the answers were cut off.
+    pub answer_count: u16,
     pub answers: Vec<Record>,
 }
 
@@ -107,7 +109,7 @@ impl Lookup {
 
     pub fn outcome(&self, capture_end: Timestamp) -> Outcome {
         if let Some(response) = &self.response {
-            return match (response.rcode, response.answers.is_empty()) {
+            return match (response.rcode, response.answer_count == 0) {
                 (dns::RCODE_NOERROR, _) if response.malformed => Outcome::Malformed,
                 (dns::RCODE_NOERROR, true) if response.truncated => Outcome::Truncated,
                 (dns::RCODE_NOERROR, false) => Outcome::Answered,
@@ -137,6 +139,9 @@ pub struct Seen {
     pub unmatched: bool,
     /// A second response to the same query.
     pub duplicate: bool,
+    /// The capture kept only the start of the packet, so the message is
+    /// incomplete (not malformed).
+    pub cut_short: bool,
 }
 
 impl Seen {
@@ -149,7 +154,14 @@ impl Seen {
         if let Some(frame) = self.retry_of {
             s.push_str(&format!(" [retry of frame {frame}]"));
         }
-        s.push_str(&self.message.notes());
+        if self.cut_short {
+            if self.message.truncated {
+                s.push_str(" [truncated]");
+            }
+            s.push_str(" [cut off by capture length limit]");
+        } else {
+            s.push_str(&self.message.notes());
+        }
         if self.unmatched {
             s.push_str(" [query not captured]");
         }
@@ -168,6 +180,8 @@ pub struct DnsPacket {
     pub error: Option<DnsError>,
     /// For an ICMP error about a DNS query: the query's frame.
     pub icmp_about: Option<u64>,
+    /// DNS over UDP cut off by the capture before even the header.
+    pub cut_short: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -224,12 +238,24 @@ impl DnsLog {
             return out;
         };
         let (payloads, over_tcp, src, dst) = match &pkt.transport {
-            Some(Transport::Udp(udp)) if udp.src_port == DNS_PORT || udp.dst_port == DNS_PORT => (
-                vec![pkt.payload.to_vec()],
-                false,
-                SocketAddr::new(src_ip, udp.src_port),
-                SocketAddr::new(dst_ip, udp.dst_port),
-            ),
+            Some(Transport::Udp(udp)) if udp.src_port == DNS_PORT || udp.dst_port == DNS_PORT => {
+                let src = SocketAddr::new(src_ip, udp.src_port);
+                let dst = SocketAddr::new(dst_ip, udp.dst_port);
+                if pkt.payload.len() < udp.payload_len as usize {
+                    // Cut off by the capture's length limit: use what's there,
+                    // which usually includes the header with the ID and rcode.
+                    match dns::parse_partial(pkt.payload) {
+                        Some(message) => {
+                            let mut seen = self.record(frame, src, dst, false, message, true);
+                            seen.cut_short = true;
+                            out.messages.push(seen);
+                        }
+                        None => out.cut_short = true,
+                    }
+                    return out;
+                }
+                (vec![pkt.payload.to_vec()], false, src, dst)
+            }
             Some(Transport::Tcp(tcp)) if tcp.src_port == DNS_PORT || tcp.dst_port == DNS_PORT => {
                 let Some(observed) = flow else {
                     return out;
@@ -250,7 +276,7 @@ impl DnsLog {
         for payload in payloads {
             match dns::parse(&payload) {
                 Ok(message) => {
-                    let seen = self.record(frame, src, dst, over_tcp, message);
+                    let seen = self.record(frame, src, dst, over_tcp, message, false);
                     out.messages.push(seen);
                 }
                 Err(e) => {
@@ -262,6 +288,7 @@ impl DnsLog {
         out
     }
 
+    /// `cut_short`: the message is incomplete because the capture cut it off.
     fn record(
         &mut self,
         frame: &Frame,
@@ -269,6 +296,7 @@ impl DnsLog {
         dst: SocketAddr,
         over_tcp: bool,
         message: Message,
+        cut_short: bool,
     ) -> Seen {
         let mut seen = Seen {
             message,
@@ -276,6 +304,7 @@ impl DnsLog {
             latency: None,
             unmatched: false,
             duplicate: false,
+            cut_short,
         };
         let msg = &seen.message;
         if !msg.response {
@@ -325,7 +354,8 @@ impl DnsLog {
                     ts: frame.ts,
                     rcode: msg.rcode,
                     truncated: msg.truncated,
-                    malformed: msg.error.is_some(),
+                    malformed: msg.error.is_some() && !cut_short,
+                    answer_count: msg.answer_count,
                     answers: msg.answers.clone(),
                 });
                 seen.latency = lookup.latency();
@@ -453,12 +483,15 @@ struct TcpStream {
 impl TcpStream {
     /// Adds a segment and returns the messages it completes.
     fn push(&mut self, tcp: &Tcp, payload: &[u8]) -> Vec<Vec<u8>> {
+        // The SYN takes one sequence number; data on it (TCP Fast Open)
+        // starts right after.
+        let mut seq = tcp.seq;
         if tcp.flags.has(TcpFlags::SYN) {
+            seq = seq.wrapping_add(1);
             *self = TcpStream {
-                next_seq: Some(tcp.seq.wrapping_add(1)),
+                next_seq: Some(seq),
                 ..TcpStream::default()
             };
-            return Vec::new();
         }
         if self.broken || tcp.payload_len == 0 {
             return Vec::new();
@@ -469,8 +502,8 @@ impl TcpStream {
             return Vec::new();
         }
         // Joined mid-connection: hope a message starts here.
-        let next = *self.next_seq.get_or_insert(tcp.seq);
-        let overlap = next.wrapping_sub(tcp.seq) as i32;
+        let next = *self.next_seq.get_or_insert(seq);
+        let overlap = next.wrapping_sub(seq) as i32;
         if overlap < 0 {
             self.break_off();
             return Vec::new();
@@ -505,6 +538,69 @@ impl TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::TcpOptions;
+
+    fn segment(seq: u32, flags: u16, payload_len: u32) -> Tcp {
+        Tcp {
+            src_port: 50000,
+            dst_port: 53,
+            seq,
+            ack: 0,
+            flags: TcpFlags(flags),
+            window: 64240,
+            header_len: 20,
+            options: TcpOptions::default(),
+            payload_len,
+        }
+    }
+
+    #[test]
+    fn tcp_fast_open_query_on_the_syn() {
+        let mut stream = TcpStream::default();
+        let syn = segment(100, TcpFlags::SYN, 5);
+        assert_eq!(
+            stream.push(&syn, &[0, 3, b'a', b'b', b'c']),
+            vec![b"abc".to_vec()]
+        );
+        // The next segment starts after the SYN's sequence number and its data.
+        let next = segment(106, TcpFlags::ACK | TcpFlags::PSH, 5);
+        assert_eq!(
+            stream.push(&next, &[0, 3, b'x', b'y', b'z']),
+            vec![b"xyz".to_vec()]
+        );
+    }
+
+    #[test]
+    fn split_messages_and_gaps() {
+        let mut stream = TcpStream::default();
+        stream.push(&segment(0, TcpFlags::SYN, 0), &[]);
+        assert!(
+            stream
+                .push(&segment(1, TcpFlags::ACK, 3), &[0, 4, b'w'])
+                .is_empty()
+        );
+        // A retransmission of the same bytes changes nothing.
+        assert!(
+            stream
+                .push(&segment(1, TcpFlags::ACK, 3), &[0, 4, b'w'])
+                .is_empty()
+        );
+        assert_eq!(
+            stream.push(&segment(4, TcpFlags::ACK, 3), b"xyz"),
+            vec![b"wxyz".to_vec()]
+        );
+        // A gap loses the message boundaries for good.
+        assert!(
+            stream
+                .push(&segment(20, TcpFlags::ACK, 3), &[0, 1, b'q'])
+                .is_empty()
+        );
+        assert!(
+            stream
+                .push(&segment(7, TcpFlags::ACK, 3), &[0, 1, b'q'])
+                .is_empty()
+        );
+    }
 
     #[test]
     fn reverse_names() {
