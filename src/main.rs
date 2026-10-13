@@ -74,14 +74,21 @@ fn dump(path: &Path, count: Option<u64>, absolute: bool) -> Result<()> {
         }
         let start = *first_ts.get_or_insert(frame.ts);
         let pkt = decode::decode(&frame);
-        let flow = flows.observe(&frame, &pkt);
-        let seq_base = flow.filter(|_| !absolute).and_then(|r| flows.seq_base(r));
+        let observed = flows.observe(&frame, &pkt);
+        let seq_base = match &observed {
+            Some(o) if !absolute => flows.seq_base(o.flow),
+            _ => None,
+        };
+        let mut text = summary::describe(&pkt, seq_base);
+        for event in observed.iter().flat_map(|o| &o.tcp_events) {
+            text.push_str(&format!(" [{event}]"));
+        }
         let line = writeln!(
             out,
             "{:>6} {:>11.6}  {}",
             frame.number,
             frame.ts.secs_since(start),
-            summary::describe(&pkt, seq_base)
+            text
         );
         if is_broken_pipe(&line) {
             return Ok(ControlFlow::Break(()));

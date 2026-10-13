@@ -1,6 +1,7 @@
 //! pcapdoctor reads packet captures and explains what went wrong on the
 //! network. See PLAN.md for where this is going.
 
+pub mod analyze;
 pub mod capture;
 pub mod decode;
 pub mod flow;
