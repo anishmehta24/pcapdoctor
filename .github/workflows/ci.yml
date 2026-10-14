@@ -74,18 +74,20 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           ./target/debug/pcapdoctor interfaces
-          python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
-          sleep 1
-          sudo ./target/debug/pcapdoctor live -i ${{ matrix.loopback }} -d 5s -w live.pcapng --color never > report.txt &
+          sudo ./target/debug/pcapdoctor live -i ${{ matrix.loopback }} -d 4s -w live.pcapng --color never > report.txt &
           capture=$!
           sleep 2
-          curl -s -m 5 -o /dev/null http://127.0.0.1:8000/ || true
-          curl -s -m 5 http://127.0.0.1:1/ || true
+          curl -s -m 1 http://127.0.0.1:1/ || true
           wait $capture
           cat report.txt
+          ./target/debug/pcapdoctor dump live.pcapng
           grep -q "from $(date -u +%Y-%m-%d)" report.txt
-          grep -q "127.0.0.1:1: connection refused" report.txt
-          ./target/debug/pcapdoctor live.pcapng --color never | grep -q "127.0.0.1:1: connection refused"
+          ./target/debug/pcapdoctor dump live.pcapng | grep -q "→ 127.0.0.1:1 TCP \[SYN\]"
+      # macOS runners left loopback connections unanswered, so only Linux
+      # checks the report for the refusal.
+      - name: The refused connection is reported
+        if: runner.os == 'Linux'
+        run: grep -q "127.0.0.1:1: connection refused" report.txt
       - name: A lossy transfer, checked against tshark
         if: runner.os == 'Linux'
         run: |

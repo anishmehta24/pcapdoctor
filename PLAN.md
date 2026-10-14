@@ -190,10 +190,17 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
   - Without `-i` it picks the interface the default route goes through: connecting a UDP socket picks a route without sending anything.
   - Tested on Linux (WSL 2, libpcap 1.10.4): loopback and Ethernet, BPF filters, `-c`, `-d`, Ctrl-C and SIGTERM, a missing interface, no root. On a lossy capture (netem, 2,438 frames) every field matches tshark except `http`, where Wireshark marks body frames as continuations (a difference listed in M7). CI captures on Linux and macOS loopback on every push, and on Linux compares the analysis flags of a lossy transfer with tshark. Windows is tested only without Npcap: its installer has no silent mode outside the paid edition, so CI can't install it.
 
-### M9 Release
+### M9 Release — done 2026-10-14
 - cargo-dist: binaries for Windows, Linux and macOS, `cargo install`, maybe Scoop and Homebrew
 - README: before/after (Wireshark screenshot next to pcapdoctor output), sample captures, notes on where we differ from tshark
 - Launch posts built around a real debugging story (r/networking, r/sysadmin, Show HN)
+- **Status:**
+  - Pushing a `v*` tag builds a release with cargo-dist 0.33 (`dist-workspace.toml`, `.github/workflows/release.yml`): binaries for Linux (x86_64 and ARM64), macOS (Intel and Apple silicon) and Windows (x86_64), checksums, and install scripts for the shell and PowerShell. v0.1.0 is the first.
+  - Linux binaries link glibc rather than being static musl builds, because a static binary can't load libpcap at run time.
+  - The GitHub Action downloads the release's binary when pinned to a tag (`@v0.1.0`), after checking its checksum, and builds from source otherwise.
+  - The crate is ready for crates.io (`cargo publish --dry-run` passes, CI files left out); publishing needs the owner's token, so `cargo install pcapdoctor` waits for that. `cargo install --git` works now.
+  - The README's before/after uses Wireshark's Expert Information as text (`tshark -z expert`) rather than a screenshot: for the demo capture it has no errors or warnings, only notes and chats. The differences from tshark and the sample captures have their own sections.
+  - Not done: Scoop and Homebrew need a bucket and a tap repository of their own; worth doing when someone asks. The launch posts are not posted yet; they should come from the author.
 
 ### Later, only if users ask
 IP reassembly, QUIC (SNI from Initial packets), HTTP/2, port-scan and DNS-tunnel detection, process names for live capture, Windows interface names ("Wi-Fi") in `interfaces`, live capture through pktmon when Npcap is missing, `--explain` through an LLM.

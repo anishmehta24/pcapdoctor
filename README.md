@@ -16,7 +16,23 @@ examples/demo.pcap: 314 packets over 8.19 s, from 2025-10-09 08:53:20.000 UTC
 ✓ 11 other connections look healthy
 ```
 
-**Status: early.** The diagnosis report, filters, the CI check and live capture work, along with packet listing (`dump`) and capture summaries (`stats`). Release binaries are next; see [PLAN.md](PLAN.md).
+**Status: 0.1.0, the first release.** The diagnosis report, filters, the CI check and live capture work, along with packet listing (`dump`) and capture summaries (`stats`). What comes next is in [PLAN.md](PLAN.md).
+
+## Install
+
+Linux and macOS:
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anishmehta24/pcapdoctor/releases/latest/download/pcapdoctor-installer.sh | sh
+```
+
+Windows (PowerShell):
+
+```
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anishmehta24/pcapdoctor/releases/latest/download/pcapdoctor-installer.ps1 | iex"
+```
+
+Or download the binary for your system from the [releases page](https://github.com/anishmehta24/pcapdoctor/releases), or build it with Rust: `cargo install --git https://github.com/anishmehta24/pcapdoctor`. It's one file with nothing else to install; reading captures needs no libpcap or Npcap.
 
 ## Usage
 
@@ -84,7 +100,7 @@ It shows:
 
 Stream numbers match Wireshark's `tcp.stream` and `udp.stream`, so `tcp.stream == 1` in Wireshark shows the same connection.
 
-Every field, flag and timing above is checked against tshark on real and generated captures. The few places where pcapdoctor differs on purpose are noted in [PLAN.md](PLAN.md).
+Every field, flag and timing above is checked against tshark on real and generated captures. The few places where pcapdoctor differs are listed [below](#where-it-differs-from-wireshark).
 
 Reads pcap and pcapng files directly, with no libpcap or Npcap needed. Supported link layers: Ethernet (with VLAN tags), Linux cooked (`tcpdump -i any`), loopback, and raw IP. Cut-off captures are read up to the last complete packet.
 
@@ -137,13 +153,13 @@ pcapdoctor check capture.pcap \
 In GitHub Actions:
 
 ```yaml
-- uses: anishmehta24/pcapdoctor@main
+- uses: anishmehta24/pcapdoctor@v0.1.0
   with:
     captures: captures/*.pcapng
     fail-on: finding.severity == error
 ```
 
-Each finding becomes an annotation on the run, and the report goes to the job summary. Until there are release binaries, the action builds pcapdoctor from source, which takes about a minute.
+Each finding becomes an annotation on the run, and the report goes to the job summary. Pinned to a release, the action downloads that release's binary; `@main` builds from source, which takes about a minute.
 
 ## Live capture
 
@@ -181,6 +197,51 @@ netem drops packets before the capture sees them, and the report places the loss
   ```
   `--comp nics` records each packet once, at the network card, instead of at every layer it passes.
 - Wireshark: File → Save As → pcapng
+
+## pcapdoctor and Wireshark
+
+Wireshark shows everything in a capture, which helps once you know what to look for. Its Expert Information for the demo capture has no errors and no warnings, only notes and chats:
+
+```
+$ tshark -r examples/demo.pcap -q -z expert
+Notes (155)
+=============
+   Frequency      Group           Protocol  Summary
+          14   Sequence                TCP  This frame initiates the connection closing
+           4   Sequence                TCP  Duplicate ACK (#1)
+   ...
+           4   Sequence                TCP  This frame is a (suspected) fast retransmission
+           4   Sequence                TCP  This frame is a (suspected) retransmission
+
+Chats (82)
+=============
+   Frequency      Group           Protocol  Summary
+          14   Sequence                TCP  Connection establish request (SYN): server port 443
+   ...
+```
+
+The failed lookup, the rejected certificate and the server that took two seconds are all in the packets, but nothing there points at them. pcapdoctor's report, at the top of this page, starts with them. Each finding carries a display filter, so the packets behind it are one paste away in Wireshark.
+
+### Where it differs from Wireshark
+
+pcapdoctor uses Wireshark's field names and follows its rules, and is checked against tshark 4.6 on every capture in this repository and dozens of Wireshark's samples. Where the two differ:
+
+- **TCP:** SACK blocks are compared using raw sequence numbers on both sides; Wireshark mixes relative and raw ones, so it never counts a segment as already SACKed. Acknowledged segments are dropped from tracking only when the ACK flag is set. Neither has changed a flag on any capture tested.
+- **DNS:** a query sent again more than 5 seconds later is still the same lookup, so a 5-second stall shows up as a slow answer. Wireshark starts a new transaction, though the `dns.*` filter fields follow Wireshark's rule. A response must come from the server the query went to. DNS is read on port 53, and mDNS and LLMNR on 5353 and 5355; Wireshark also guesses at DNS on other UDP ports. Wireshark still shows the type and address of a record whose name is broken.
+- **TLS:** captures that carry their own keys aren't decrypted. TLS is recognized from the ClientHello, so a connection that started before the capture isn't seen as TLS; Wireshark goes by port 443. SSLv2-format hellos aren't read. In TLS 1.3, a 19-byte encrypted record before the client's Finished is taken to be an alert; tshark can't tell without the keys.
+- **HTTP:** fields are on the frame that ends the headers, as in Wireshark with "Reassemble HTTP bodies" off. Pipelined responses are always matched to their requests; Wireshark does so only when the requests came in separate segments.
+
+The details, with the numbers behind each check, are in [PLAN.md](PLAN.md).
+
+## Sample captures
+
+Each one comes with what tshark says about it (`*.tshark.txt` next to it), and with the script that made it:
+
+- [`examples/demo.pcap`](examples/demo.pcap): a laptop browsing for ten seconds, with a failed lookup, a rejected certificate, a slow server and a lossy download.
+- [`tests/fixtures/tcp-zoo.pcap`](tests/fixtures/tcp-zoo.pcap): one connection for each TCP problem Wireshark flags: retransmissions of every kind, duplicate ACKs, out-of-order and lost segments, zero and full windows, keep-alives.
+- [`tests/fixtures/dns-zoo.pcap`](tests/fixtures/dns-zoo.pcap): DNS error codes, servers that don't answer or can't be reached, retries, a truncated answer retried over TCP, IPv6, broken names.
+- [`tests/fixtures/tls-zoo.pcap`](tests/fixtures/tls-zoo.pcap): 15 TLS handshakes, good and failed, with real certificates from a test CA.
+- [`tests/fixtures/http-zoo.pcap`](tests/fixtures/http-zoo.pcap): HTTP/1.x requests and responses, from simple to pipelined, chunked, `100 Continue` and upgraded.
 
 ## Building
 
