@@ -76,7 +76,7 @@ fn diagnosis(frames: &[Frame]) -> Diagnosis {
         analyzer.observe(frame, &pkt);
         stats.add(frame, &pkt);
     }
-    diagnose::diagnose(&stats, &analyzer, None)
+    diagnose::diagnose(&stats, &analyzer, Default::default())
 }
 
 /// capture → [(filter, frames)]

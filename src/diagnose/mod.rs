@@ -281,6 +281,17 @@ pub struct Overview {
     pub http_requests: usize,
     /// The file ends partway through the packet after this many.
     pub cut_off_after: Option<u64>,
+    /// Packets a live capture dropped because they weren't read in time.
+    pub dropped: Option<u64>,
+}
+
+/// What reading the capture showed about it, apart from its packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureInfo {
+    /// The file ends partway through the packet after this many.
+    pub cut_off_after: Option<u64>,
+    /// Packets a live capture dropped because they weren't read in time.
+    pub dropped: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -299,9 +310,8 @@ impl Diagnosis {
     }
 }
 
-/// Runs every rule over a fully analyzed capture. `cut_off_after` is set
-/// when the file ends partway through a packet.
-pub fn diagnose(stats: &Stats, analyzer: &Analyzer, cut_off_after: Option<u64>) -> Diagnosis {
+/// Runs every rule over a fully analyzed capture.
+pub fn diagnose(stats: &Stats, analyzer: &Analyzer, info: CaptureInfo) -> Diagnosis {
     let ctx = Context {
         analyzer,
         end: stats.last_ts.unwrap_or_default(),
@@ -321,7 +331,7 @@ pub fn diagnose(stats: &Stats, analyzer: &Analyzer, cut_off_after: Option<u64>) 
     findings.extend(http);
     findings.extend(tcp::findings(&ctx, &explained));
     findings.extend(slow::findings(&ctx));
-    findings.extend(capture_findings(stats, cut_off_after));
+    findings.extend(capture_findings(stats, info));
 
     let mut findings: Vec<Finding> = findings.into_iter().map(Finding::tidy).collect();
     findings.sort_by(|a, b| {
@@ -350,15 +360,16 @@ pub fn diagnose(stats: &Stats, analyzer: &Analyzer, cut_off_after: Option<u64>) 
         dns_lookups: analyzer.dns.lookups().len(),
         tls_handshakes: analyzer.tls.handshakes().len(),
         http_requests: analyzer.http.exchanges().len(),
-        cut_off_after,
+        cut_off_after: info.cut_off_after,
+        dropped: info.dropped,
     };
     Diagnosis { findings, overview }
 }
 
 /// Problems with the capture itself, which limit what the rest can see.
-fn capture_findings(stats: &Stats, cut_off_after: Option<u64>) -> Vec<Finding> {
+fn capture_findings(stats: &Stats, info: CaptureInfo) -> Vec<Finding> {
     let mut out = Vec::new();
-    if let Some(frames) = cut_off_after {
+    if let Some(frames) = info.cut_off_after {
         out.push(
             Finding::new(
                 Severity::Warning,
@@ -371,6 +382,21 @@ fn capture_findings(stats: &Stats, cut_off_after: Option<u64>) -> Vec<Finding> {
             )
             .frames([frames])
             .hint("everything before the cut was read; what happened after it is unknown"),
+        );
+    }
+    if let Some(dropped) = info.dropped.filter(|&n| n > 0) {
+        out.push(
+            Finding::new(
+                Severity::Warning,
+                Category::Capture,
+                "",
+                format!(
+                    "the capture dropped {} it couldn't keep up with",
+                    count(dropped, "packet", "packets")
+                ),
+            )
+            .measure("packets", dropped as f64)
+            .hint("some loss reported here may be the capture's, not the network's; a capture filter keeps up better"),
         );
     }
     if stats.snapped.count > 0 {

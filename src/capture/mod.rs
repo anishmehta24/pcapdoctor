@@ -1,12 +1,15 @@
-//! Reads capture files (pcap and pcapng) without libpcap.
+//! Reads capture files (pcap and pcapng) without libpcap, and writes pcapng.
 
 mod pcap;
 mod pcapng;
+mod write;
 
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
+
+pub use write::{InterfaceInfo, PcapNgWriter};
 
 /// Largest packet we accept. Real link layers stay far below this, so a
 /// bigger value means the file is corrupt.

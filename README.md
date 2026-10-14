@@ -16,7 +16,7 @@ examples/demo.pcap: 314 packets over 8.19 s, from 2025-10-09 08:53:20.000 UTC
 ✓ 11 other connections look healthy
 ```
 
-**Status: early.** The diagnosis report, filters and the CI check work, along with packet listing (`dump`) and capture summaries (`stats`). Live capture is next; see [PLAN.md](PLAN.md).
+**Status: early.** The diagnosis report, filters, the CI check and live capture work, along with packet listing (`dump`) and capture summaries (`stats`). Release binaries are next; see [PLAN.md](PLAN.md).
 
 ## Usage
 
@@ -145,15 +145,41 @@ In GitHub Actions:
 
 Each finding becomes an annotation on the run, and the report goes to the job summary. Until there are release binaries, the action builds pcapdoctor from source, which takes about a minute.
 
+## Live capture
+
+`pcapdoctor live` captures from a network interface, then prints the same report. Here three downloads ran over a loopback link that Linux's `tc netem` made drop 2% of packets:
+
+```
+$ sudo pcapdoctor live -i lo -w loss.pcapng --capture-filter 'tcp port 8001'
+Capturing on lo; Ctrl-C stops it
+^C
+loss.pcapng: 2,438 packets over 5.67 s, from 2026-10-14 13:36:35.733 UTC
+
+⚠ LOSS  127.0.0.1 → 127.0.0.1:8001: 2.1% of segments retransmitted (36 of 1,738), mostly by the server, in 2 of 3 connections  frames 189-201, 272-2190
+        → the first copies never reached the capture point, so packets were lost between the server and the capture point
+✓ 1 other connection looks healthy
+```
+
+netem drops packets before the capture sees them, and the report places the loss there.
+
+- `-i` takes the interface's name, its number in `pcapdoctor interfaces`, one of its addresses, or its description. Without `-i`, it captures on the interface with the route to the internet.
+- `-d 30s` stops after a while and `-c 1000` after so many packets; Ctrl-C stops it any time. The report comes after.
+- `-w capture.pcapng` keeps the packets, so the frames in the report can be opened in Wireshark.
+- `--capture-filter 'port 443'` captures only what matches, in tcpdump's syntax. On a busy link that keeps the capture up to speed. If the system still drops packets, the report says how many, since a dropped packet looks like a lost one.
+- It needs libpcap, which macOS has and Linux distributions package (`libpcap0.8` on Debian and Ubuntu), or [Npcap](https://npcap.com) on Windows. pcapdoctor loads it only for `live` and `interfaces`, so reading files never needs it.
+- Capturing needs root (`sudo`) or administrator rights. On Linux, `sudo setcap cap_net_raw,cap_net_admin=eip $(which pcapdoctor)` lets it capture without root.
+
 ## Getting a capture
 
+- `pcapdoctor live -w capture.pcapng`, above
 - Linux/macOS: `sudo tcpdump -i any -w capture.pcap`
-- Windows, with nothing to install (admin prompt):
+- Windows, with nothing to install (as administrator):
   ```
-  pktmon start --capture --pkt-size 0
+  pktmon start --capture --comp nics --pkt-size 0 --file-name capture.etl
   pktmon stop
-  pktmon etl2pcap PktMon.etl --out capture.pcapng
+  pktmon etl2pcap capture.etl --out capture.pcapng
   ```
+  `--comp nics` records each packet once, at the network card, instead of at every layer it passes.
 - Wireshark: File → Save As → pcapng
 
 ## Building

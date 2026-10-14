@@ -41,3 +41,66 @@ jobs:
       - name: The second check failed
         if: steps.errors.outcome != 'failure'
         run: exit 1
+
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            loopback: lo
+          - os: macos-latest
+            loopback: lo0
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libpcap0.8t64 tshark
+      - run: cargo build
+      - name: Without Npcap, live says where to get it
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./target/debug/pcapdoctor interfaces 2> err.txt || grep -q "needs Npcap" err.txt
+      - name: Capture on loopback
+        if: runner.os != 'Windows'
+        run: |
+          ./target/debug/pcapdoctor interfaces
+          python3 -m http.server 8000 >/dev/null 2>&1 &
+          sleep 1
+          sudo ./target/debug/pcapdoctor live -i ${{ matrix.loopback }} -d 5s -w live.pcapng --color never > report.txt &
+          capture=$!
+          sleep 2
+          curl -s -o /dev/null http://127.0.0.1:8000/
+          curl -s http://127.0.0.1:1/ || true
+          wait $capture
+          cat report.txt
+          grep -q "from $(date -u +%Y-%m-%d)" report.txt
+          grep -q "127.0.0.1:1: connection refused" report.txt
+          ./target/debug/pcapdoctor live.pcapng --color never | grep -q "127.0.0.1:1: connection refused"
+      - name: A lossy transfer, checked against tshark
+        if: runner.os == 'Linux'
+        run: |
+          head -c 1000000 /dev/urandom > big.bin
+          python3 -m http.server 8001 >/dev/null 2>&1 &
+          sudo ip link set lo mtu 1500
+          sudo tc qdisc add dev lo root netem loss 5% delay 10ms
+          sudo ./target/debug/pcapdoctor live -i lo --capture-filter 'tcp port 8001' -w loss.pcapng --color never > loss.txt &
+          capture=$!
+          sleep 2
+          for i in 1 2 3; do curl -s -o /dev/null http://127.0.0.1:8001/big.bin; done
+          sleep 1
+          sudo pkill -INT -x pcapdoctor
+          wait $capture
+          sudo tc qdisc del dev lo root
+          cat loss.txt
+          grep -q "LOSS" loss.txt
+          for flag in retransmission fast_retransmission duplicate_ack lost_segment out_of_order; do
+            ./target/debug/pcapdoctor dump loss.pcapng -f "tcp.analysis.$flag" | awk '{print $1}' > ours.txt
+            tshark -r loss.pcapng -Y "tcp.analysis.$flag" -T fields -e frame.number > theirs.txt
+            echo "$flag: pcapdoctor $(wc -l < ours.txt), tshark $(wc -l < theirs.txt)"
+            diff ours.txt theirs.txt || failed=1
+          done
+          exit ${failed:-0}

@@ -31,7 +31,7 @@ fn diagnose_frames(frames: &[Frame]) -> Diagnosis {
         analyzer.observe(frame, &pkt);
         stats.add(frame, &pkt);
     }
-    diagnose::diagnose(&stats, &analyzer, None)
+    diagnose::diagnose(&stats, &analyzer, Default::default())
 }
 
 fn diagnose_file(file: &str) -> Diagnosis {

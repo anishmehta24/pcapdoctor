@@ -1,19 +1,24 @@
-use std::io::{self, BufWriter, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use pcapdoctor::analyze::{Analyzer, PacketFindings};
-use pcapdoctor::capture::{Capture, CaptureError, Frame, Timestamp};
+use pcapdoctor::capture::{Capture, CaptureError, Frame, InterfaceInfo, PcapNgWriter, Timestamp};
 use pcapdoctor::decode::Packet;
-use pcapdoctor::diagnose::{Diagnosis, Finding, Severity};
+use pcapdoctor::diagnose::{CaptureInfo, Diagnosis, Finding, Severity};
 use pcapdoctor::filter::{self, Filter, PacketView, Target, Tracker, Whole};
+use pcapdoctor::live::{self, Live};
 use pcapdoctor::report::{html, json, text};
 use pcapdoctor::stats::{self, Stats};
-use pcapdoctor::{decode, diagnose, summary};
+use pcapdoctor::{decode, diagnose, summary, units};
 
 /// Findings shown in text output unless `--all` is given.
 const TEXT_FINDINGS: usize = 30;
@@ -21,6 +26,8 @@ const TEXT_FINDINGS: usize = 30;
 const CHECK_PACKETS: usize = 10;
 /// What `check` fails on when no `--fail-on` is given.
 const DEFAULT_FAIL_ON: &str = "finding.severity == error";
+/// Bytes kept from each packet in a live capture: all of it, as tcpdump does.
+const SNAPLEN: u32 = 262_144;
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +49,13 @@ struct ReportArgs {
     /// Capture file (.pcap or .pcapng)
     #[arg(required = true)]
     file: Option<PathBuf>,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+/// How to show a report.
+#[derive(Args)]
+struct OutputArgs {
     /// Output format
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
@@ -123,6 +137,42 @@ enum Command {
     },
     /// List the fields filters can use
     Fields,
+    /// Capture from a network interface, then diagnose what was captured
+    Live(LiveArgs),
+    /// List the interfaces live can capture on
+    Interfaces,
+}
+
+#[derive(Args)]
+struct LiveArgs {
+    /// Interface: its name, its number in `pcapdoctor interfaces`, one of its
+    /// addresses, or its description [default: the one with the route to
+    /// the internet]
+    #[arg(short, long, value_name = "IFACE")]
+    interface: Option<String>,
+    /// Stop after this long, such as 30s, 5m or 1h [default: at Ctrl-C]
+    #[arg(short, long, value_name = "TIME", value_parser = duration_arg)]
+    duration: Option<Duration>,
+    /// Stop after this many packets
+    #[arg(short = 'c', long)]
+    count: Option<u64>,
+    /// Also save the packets to this file (pcapng), to open in Wireshark
+    #[arg(short, long, value_name = "PATH")]
+    write: Option<PathBuf>,
+    /// Capture only packets that match this filter, in tcpdump's syntax:
+    /// "port 443", "host 10.0.0.5"
+    #[arg(long, value_name = "BPF")]
+    capture_filter: Option<String>,
+    /// Also capture traffic between other machines, where the network
+    /// shows it
+    #[arg(long)]
+    promisc: bool,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+fn duration_arg(s: &str) -> Result<Duration, String> {
+    units::parse_duration(s).ok_or_else(|| "expected a time such as 30s, 5m or 1h".to_string())
 }
 
 fn main() -> ExitCode {
@@ -142,6 +192,8 @@ fn main() -> ExitCode {
             color,
         }) => check(&files, &fail_on, format, color),
         Some(Command::Fields) => fields().map(|()| true),
+        Some(Command::Live(args)) => live(args).map(|()| true),
+        Some(Command::Interfaces) => interfaces().map(|()| true),
         None => report(cli.report).map(|()| true),
     };
     match result {
@@ -266,21 +318,28 @@ fn diagnose_file(path: &Path) -> Result<Diagnosis> {
         stats.add(&frame, &pkt);
         Ok(ControlFlow::Continue(()))
     })?;
-    let cut_off = match end {
+    let cut_off_after = match end {
         End::CutOff { frames } => Some(frames),
         End::Complete => None,
     };
-    Ok(diagnose::diagnose(&stats, &analyzer, cut_off))
+    let info = CaptureInfo {
+        cut_off_after,
+        dropped: None,
+    };
+    Ok(diagnose::diagnose(&stats, &analyzer, info))
 }
 
 fn report(args: ReportArgs) -> Result<()> {
     let path = args.file.expect("clap requires a file");
     let diagnosis = diagnose_file(&path)?;
-    let name = path.display().to_string();
+    show_report(&path.display().to_string(), &diagnosis, &args.output)
+}
+
+fn show_report(name: &str, diagnosis: &Diagnosis, args: &OutputArgs) -> Result<()> {
     let body = match args.format {
-        Format::Text => text::render(&name, &diagnosis, (!args.all).then_some(TEXT_FINDINGS)),
-        Format::Json => json::render(&name, &diagnosis),
-        Format::Html => html::render(&name, &diagnosis),
+        Format::Text => text::render(name, diagnosis, (!args.all).then_some(TEXT_FINDINGS)),
+        Format::Json => json::render(name, diagnosis),
+        Format::Html => html::render(name, diagnosis),
     };
     if let Some(output) = &args.output {
         let body = match args.format {
@@ -517,6 +576,181 @@ fn fields() -> Result<()> {
             out.push_str("\nFields of findings, for check --fail-on:\n");
         }
         let _ = writeln!(out, "{name:<width$}  {:<15}  {help}", kind.describe());
+    }
+    ignore_broken_pipe(io::stdout().lock().write_all(out.as_bytes()))
+}
+
+/// Captures until the time or count runs out or Ctrl-C, analyzing as the
+/// packets come, then prints the report.
+fn live(args: LiveArgs) -> Result<()> {
+    let list = live::interfaces()?;
+    let chosen = match &args.interface {
+        Some(wanted) => live::find(&list, wanted),
+        None => Some(live::default_interface(&list).context(
+            "no interface is up with an address; pcapdoctor interfaces lists them, and -i picks one",
+        )?),
+    };
+    // A name libpcap knows but doesn't list, such as a VLAN device, is
+    // still worth trying.
+    let (device, label, description) = match chosen {
+        Some(i) => (
+            list[i].name.as_str(),
+            list[i].label(),
+            list[i].description.as_deref(),
+        ),
+        None => {
+            let wanted = args
+                .interface
+                .as_deref()
+                .expect("only a named interface is missing");
+            (wanted, wanted, None)
+        }
+    };
+    let options = live::Options {
+        snaplen: SNAPLEN,
+        promisc: args.promisc,
+        filter: args.capture_filter.as_deref(),
+    };
+    let (mut capture, warning) = Live::open(device, &options)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    let mut file = match &args.write {
+        Some(path) => {
+            let out =
+                File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+            let interface = InterfaceInfo {
+                link_type: capture.link_type(),
+                snaplen: SNAPLEN,
+                name: device,
+                description,
+            };
+            Some(PcapNgWriter::new(BufWriter::new(out), &interface)?)
+        }
+        None => None,
+    };
+
+    // The first Ctrl-C (or kill) ends the capture and shows the report; a
+    // second one gives up on it. A signal sent to sudo and to us both
+    // arrives twice at once, so the second must come a moment later.
+    let stop = Arc::new(AtomicBool::new(false));
+    let handler_stop = Arc::clone(&stop);
+    let mut stopped_at = None;
+    ctrlc::set_handler(move || match stopped_at {
+        None => {
+            stopped_at = Some(Instant::now());
+            handler_stop.store(true, Ordering::SeqCst);
+        }
+        Some(at) if at.elapsed() > Duration::from_millis(500) => std::process::exit(130),
+        Some(_) => {}
+    })
+    .context("cannot catch Ctrl-C")?;
+
+    let started = Instant::now();
+    let deadline = args.duration.map(|d| started + d);
+    match args.duration {
+        Some(d) => eprintln!(
+            "Capturing on {label} for {}; Ctrl-C stops it sooner",
+            plain_duration(d)
+        ),
+        None => eprintln!("Capturing on {label}; Ctrl-C stops it"),
+    }
+    let progress = io::stderr().is_terminal();
+    let mut shown = started;
+    let mut stats = Stats::default();
+    let mut analyzer = Analyzer::new();
+    let mut packets = 0u64;
+    while !stop.load(Ordering::SeqCst)
+        && deadline.is_none_or(|d| Instant::now() < d)
+        && args.count.is_none_or(|c| packets < c)
+    {
+        if let Some(frame) = capture.next_frame()? {
+            if let Some(file) = &mut file {
+                file.write(&frame).context("cannot save the capture")?;
+            }
+            let pkt = decode::decode(&frame);
+            analyzer.observe(&frame, &pkt);
+            stats.add(&frame, &pkt);
+            packets += 1;
+        }
+        if progress && shown.elapsed() >= Duration::from_secs(1) {
+            eprint!("\r{} so far ", text::plural(packets, "packet", "packets"));
+            shown = Instant::now();
+        }
+    }
+    if progress {
+        eprint!("\r{:30}\r", "");
+    }
+    let dropped = capture.dropped();
+    drop(capture);
+    if let Some(file) = &mut file {
+        file.flush().context("cannot save the capture")?;
+    }
+
+    let info = CaptureInfo {
+        cut_off_after: None,
+        dropped,
+    };
+    let diagnosis = diagnose::diagnose(&stats, &analyzer, info);
+    let name = match &args.write {
+        Some(path) => path.display().to_string(),
+        None => format!("{label} (live)"),
+    };
+    show_report(&name, &diagnosis, &args.output)?;
+    if args.write.is_none() && !diagnosis.findings.is_empty() {
+        eprintln!(
+            "note: -w FILE saves the packets, so the frames above can be opened in Wireshark"
+        );
+    }
+    Ok(())
+}
+
+/// "30 s" for whole seconds, as people type them.
+fn plain_duration(d: Duration) -> String {
+    match d.subsec_nanos() {
+        0 => format!("{} s", d.as_secs()),
+        _ => units::duration(d.as_secs_f64()),
+    }
+}
+
+fn interfaces() -> Result<()> {
+    use std::fmt::Write as _;
+    let list = live::interfaces()?;
+    let default = live::default_interface(&list);
+    let mut out = format!("{}\n\n", live::library_version()?);
+    for (i, iface) in list.iter().enumerate() {
+        let _ = write!(out, "{:>2}. {}", i + 1, iface.name);
+        if let Some(description) = &iface.description {
+            let _ = write!(out, "  {description}");
+        }
+        if default == Some(i) {
+            out.push_str("  (default)");
+        }
+        out.push('\n');
+        let state = [
+            (iface.loopback, "loopback"),
+            (iface.wireless, "wireless"),
+            (!iface.up, "down"),
+            (iface.up && !iface.running, "not running"),
+            (iface.disconnected, "disconnected"),
+        ];
+        let mut notes: Vec<String> = state
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, word)| word.to_string())
+            .collect();
+        let addresses: Vec<String> = iface.addresses.iter().map(|a| a.to_string()).collect();
+        if !addresses.is_empty() {
+            notes.push(addresses.join(", "));
+        }
+        if !notes.is_empty() {
+            let _ = writeln!(out, "    {}", notes.join("; "));
+        }
+    }
+    if list.is_empty() {
+        out.push_str("No interfaces found. Listing them may need root, or administrator rights on Windows.\n");
+    } else {
+        out.push_str("\npcapdoctor live -i NAME or -i NUMBER captures on one; without -i it uses the default.\n");
     }
     ignore_broken_pipe(io::stdout().lock().write_all(out.as_bytes()))
 }

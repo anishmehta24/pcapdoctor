@@ -40,14 +40,16 @@ Who it's for: support engineers handed a customer's capture, backend developers 
 | `pcapdoctor FILE [--format text\|json\|html] [-o PATH] [--all]` | diagnosis report (default command) | M6 |
 | `pcapdoctor check FILE... [--fail-on FILTER]...` | CI mode: exit 1 when something matches | M7 |
 | `pcapdoctor fields` | the fields filters can use | M7 |
-| `pcapdoctor live -i IFACE -d 30s` | capture, then diagnose | M8 |
+| `pcapdoctor live [-i IFACE] [-d 30s] [-w out.pcapng]` | capture, then diagnose | M8 |
+| `pcapdoctor interfaces` | what `live` can capture on | M8 |
 
 Exit codes: 0 ok, 1 `check` found problems, 2 error.
 
 ## Architecture
 
 ```
-capture/   pcap + pcapng readers, our own code (no libpcap)    -> Frame { number, ts, link_type, data }
+capture/   pcap + pcapng readers and a pcapng writer (no libpcap) -> Frame { number, ts, link_type, data }
+live/      libpcap or Npcap, loaded at run time                 -> Frame  (M8)
 decode/    link -> IPv4/IPv6/ARP -> TCP/UDP/ICMP                -> Packet { layers, error }
 flow/      bidirectional 5-tuple table, TCP state per flow      (M2)
 analyze/   TCP health, DNS, TLS, HTTP detectors                  (M3-M5)
@@ -88,7 +90,7 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
 - RST classified: refused (answer to a SYN), aborted mid-stream, after FIN
 - SYN never answered (connection timeout)
 - **Done when:** counts match tshark's `tcp.analysis.*` on samples and on captures made with `tc netem` loss, apart from documented differences.
-- **Status:** the rules follow Wireshark's `tcp_analyze_sequence_number`, in the same order. Every flag matches tshark on 2,161 TCP frames (198 flagged) across 21 captures, including `tests/fixtures/tcp-zoo.pcap`, a generated capture with one connection per case so all 14 kinds of flag are covered. Initial RTT matches tshark on all 19 connections that have one. Still to do: a real capture with `tc netem` loss.
+- **Status:** the rules follow Wireshark's `tcp_analyze_sequence_number`, in the same order. Every flag matches tshark on 2,161 TCP frames (198 flagged) across 21 captures, including `tests/fixtures/tcp-zoo.pcap`, a generated capture with one connection per case so all 14 kinds of flag are covered. Initial RTT matches tshark on all 19 connections that have one. A live capture of downloads with 2% loss from `tc netem` matches too (M8): 198 flags on 2,438 frames, among them 36 retransmissions and 122 duplicate ACKs. CI repeats that with 5% loss on every push.
 
 ### M4 DNS — done 2026-10-13
 - Wire format: header, questions, answers (A, AAAA, CNAME, ...), name compression with loop protection; over UDP and TCP
@@ -176,10 +178,17 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
     - Wireshark still shows the type and address of a DNS record whose name is broken.
   - `check` exits with 1 when any `--fail-on` filter matches, 0 when none does, and 2 on errors. The default is `finding.severity == error`. `--format github` adds workflow annotations. `action.yml` builds pcapdoctor and runs `check`; CI runs it on the demo capture both ways.
 
-### M8 Live capture
-- `pcap` crate behind a `live` cargo feature (libpcap on Linux/macOS, Npcap on Windows)
+### M8 Live capture — done 2026-10-14
+- libpcap on Linux/macOS, Npcap on Windows
 - `live -i IFACE -d 30s [-w out.pcapng]`, plus a command to list interfaces
 - Docs: Windows can capture with the built-in `pktmon`, no install needed
+- **Status:**
+  - libpcap is loaded when `live` or `interfaces` runs, not linked at build time (the plan was the `pcap` crate behind a cargo feature). A binary linked to Npcap's `wpcap.dll` doesn't start on a machine without Npcap, so release binaries would have had to choose between live capture and reading files anywhere. Loading it at run time gives one binary that does both, and says how to get the library when it's missing. The C API used is small: about 20 functions, in `src/live/ffi.rs`.
+  - Packets are analyzed as they arrive, so memory doesn't grow with the length of the capture; `-w` streams them to a pcapng file (our own writer, with nanosecond timestamps when the system gives them).
+  - Reads don't block: on Linux, libpcap's TPACKET_V3 can wait forever for the first packet whatever the timeout, so a quiet interface would never stop at `-d`. With nothing to read, pcapdoctor sleeps 20 ms and asks again.
+  - Ctrl-C (or SIGTERM) ends the capture and prints the report; a second Ctrl-C, half a second or more later, gives up. Packets the system dropped because they weren't read in time become a capture warning, since they look like loss.
+  - Without `-i` it picks the interface the default route goes through: connecting a UDP socket picks a route without sending anything.
+  - Tested on Linux (WSL 2, libpcap 1.10.4): loopback and Ethernet, BPF filters, `-c`, `-d`, Ctrl-C and SIGTERM, a missing interface, no root. On a lossy capture (netem, 2,438 frames) every field matches tshark except `http`, where Wireshark marks body frames as continuations (a difference listed in M7). CI captures on Linux and macOS loopback on every push, and on Linux compares the analysis flags of a lossy transfer with tshark. Windows is tested only without Npcap: its installer has no silent mode outside the paid edition, so CI can't install it.
 
 ### M9 Release
 - cargo-dist: binaries for Windows, Linux and macOS, `cargo install`, maybe Scoop and Homebrew
@@ -187,7 +196,7 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
 - Launch posts built around a real debugging story (r/networking, r/sysadmin, Show HN)
 
 ### Later, only if users ask
-IP reassembly, QUIC (SNI from Initial packets), HTTP/2, port-scan and DNS-tunnel detection, process names for live capture, `--explain` through an LLM.
+IP reassembly, QUIC (SNI from Initial packets), HTTP/2, port-scan and DNS-tunnel detection, process names for live capture, Windows interface names ("Wi-Fi") in `interfaces`, live capture through pktmon when Npcap is missing, `--explain` through an LLM.
 
 ## Testing
 
@@ -197,7 +206,8 @@ IP reassembly, QUIC (SNI from Initial packets), HTTP/2, port-scan and DNS-tunnel
 - **Making captures:**
   - Wireshark's sample captures
   - `tcpdump -w`
-  - Windows: `pktmon start --capture --pkt-size 0`, then `pktmon stop` and `pktmon etl2pcap PktMon.etl --out capture.pcapng` (admin, nothing to install)
+  - Windows: `pktmon start --capture --comp nics --pkt-size 0`, then `pktmon stop` and `pktmon etl2pcap PktMon.etl --out capture.pcapng` (admin, nothing to install)
+  - `pcapdoctor live -w capture.pcapng`
   - Packet loss on Linux/WSL: `tc qdisc add dev eth0 root netem loss 5%`
   - NXDOMAIN: `nslookup does-not-exist.example`
   - RST: `curl http://localhost:1`
@@ -206,3 +216,4 @@ IP reassembly, QUIC (SNI from Initial packets), HTTP/2, port-scan and DNS-tunnel
 
 - License: MIT or Apache-2.0 (decided 2026-10-13).
 - Name: `pcapdoctor` was free on crates.io on 2026-10-13.
+- Live capture loads libpcap at run time instead of linking it (2026-10-14); see M8.

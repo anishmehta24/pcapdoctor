@@ -30,6 +30,7 @@ pub fn render(file: &str, diagnosis: &Diagnosis) -> String {
             "cut_off_after",
             o.cut_off_after.map_or(Json::Null, Json::Int),
         ),
+        ("dropped", o.dropped.map_or(Json::Null, Json::Int)),
     ]);
     let summary = Json::Object(vec![
         ("errors", count(diagnosis.count(Severity::Error))),

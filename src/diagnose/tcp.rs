@@ -398,9 +398,6 @@ fn loss(ctx: &Context, label: String, flows: &[usize]) -> Option<Finding> {
             }
         })
     };
-    if flows.len() > 1 {
-        text.push_str(&format!(", over {} connections", flows.len()));
-    }
     let mut spans: Vec<(u64, u64)> = Vec::new();
     for &i in flows {
         let conn = ctx.conn(i);
@@ -421,6 +418,17 @@ fn loss(ctx: &Context, label: String, flows: &[usize]) -> Option<Finding> {
                 > 0
         })
         .collect();
+    // The rate counts every connection between the two; say how many of
+    // them resent anything.
+    if involved.len() < flows.len() {
+        text.push_str(&format!(
+            ", in {} of {} connections",
+            involved.len(),
+            flows.len()
+        ));
+    } else if flows.len() > 1 {
+        text.push_str(&format!(", over {} connections", flows.len()));
+    }
     Some(
         Finding::new(severity, Category::Loss, label, text)
             .maybe_hint(hint)

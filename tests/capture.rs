@@ -3,7 +3,7 @@ mod common;
 use std::io::Cursor;
 
 use common::*;
-use pcapdoctor::capture::{Capture, CaptureError, Frame, Timestamp};
+use pcapdoctor::capture::{Capture, CaptureError, Frame, InterfaceInfo, PcapNgWriter, Timestamp};
 
 /// Reads every frame, and the error that stopped reading, if any.
 fn read_all(bytes: Vec<u8>) -> (Vec<Frame>, Option<CaptureError>) {
@@ -165,6 +165,34 @@ fn absurd_packet_length_is_corrupt() {
     bytes.extend(u32::MAX.to_le_bytes());
     let (_, err) = read_all(bytes);
     assert!(matches!(err, Some(CaptureError::Corrupt(_))), "{err:?}");
+}
+
+/// What `live -w` writes reads back the same: data of every length (blocks
+/// pad to 4 bytes), nanosecond timestamps, and lengths cut by a snaplen.
+#[test]
+fn written_pcapng_reads_back() {
+    let frames: Vec<Frame> = (0..6u8)
+        .map(|n| Frame {
+            number: u64::from(n) + 1,
+            ts: Timestamp(1_760_000_000_123_456_789 + u64::from(n) * 1_001),
+            link_type: LINKTYPE_ETHERNET,
+            orig_len: u32::from(n) + if n == 5 { 1000 } else { 0 },
+            data: vec![n; usize::from(n)],
+        })
+        .collect();
+    let interface = InterfaceInfo {
+        link_type: LINKTYPE_ETHERNET,
+        snaplen: 262_144,
+        name: r"\Device\NPF_{4F1A}",
+        description: Some("Wi-Fi"),
+    };
+    let mut writer = PcapNgWriter::new(Vec::new(), &interface).unwrap();
+    for frame in &frames {
+        writer.write(frame).unwrap();
+    }
+    let bytes = writer.into_inner();
+    assert_eq!(bytes.len() % 4, 0);
+    assert_eq!(read_ok(bytes), frames);
 }
 
 /// Corrupted capture files must give an error, never a panic or a huge

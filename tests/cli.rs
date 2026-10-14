@@ -368,3 +368,13 @@ fn readme_shows_real_check_output() {
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap(), block);
 }
+
+#[test]
+fn live_checks_its_arguments_before_capturing() {
+    let (code, _, stderr) = pcapdoctor(&["live", "-d", "soon"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("expected a time such as 30s, 5m or 1h"),
+        "{stderr}"
+    );
+}

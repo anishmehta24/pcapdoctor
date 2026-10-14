@@ -62,6 +62,24 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
+/// "30s", "500ms", "2m", "1.5h", or a number of seconds.
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (number, unit) = s.split_at(end);
+    let scale = match unit.trim() {
+        "" | "s" | "sec" => 1.0,
+        "ms" => 1e-3,
+        "m" | "min" => 60.0,
+        "h" => 3600.0,
+        _ => return None,
+    };
+    let secs = number.parse::<f64>().ok()? * scale;
+    (secs > 0.0 && secs < 1e9).then(|| std::time::Duration::from_secs_f64(secs))
+}
+
 pub fn percent(part: u64, whole: u64) -> String {
     if whole == 0 {
         return "-".to_string();
@@ -229,6 +247,20 @@ mod tests {
         assert_eq!(duration(4.5), "4.50 s");
         assert_eq!(duration(265.0), "4m 25s");
         assert_eq!(duration(7380.0), "2h 03m");
+    }
+
+    #[test]
+    fn parses_durations() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("1.5h"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("10 parsecs"), None);
+        assert_eq!(parse_duration("s"), None);
+        assert_eq!(parse_duration(""), None);
     }
 
     #[test]
