@@ -87,7 +87,8 @@ jobs:
       # checks the report for the refusal.
       - name: The refused connection is reported
         if: runner.os == 'Linux'
-        run: grep -q "127.0.0.1:1: connection refused" report.txt
+        run: |
+          grep -q "127.0.0.1:1: connection refused" report.txt
       - name: A lossy transfer, checked against tshark
         if: runner.os == 'Linux'
         run: |
