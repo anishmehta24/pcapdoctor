@@ -108,3 +108,20 @@ jobs:
             diff ours.txt theirs.txt || failed=1
           done
           exit ${failed:-0}
+
+  action-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The released action
+        uses: anishmehta24/pcapdoctor@v0.1.0
+        with:
+          captures: examples/*.pcap
+          fail-on: finding.category == http
+      - name: It downloaded the release instead of building
+        shell: bash
+        run: test -d "$RUNNER_TEMP/pcapdoctor-download"
