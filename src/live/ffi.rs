@@ -5,7 +5,7 @@
 //! a capture starts keeps file reading free of it, and lets a missing library
 //! be explained instead of crashing at startup.
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 use libloading::Library;
@@ -67,8 +67,8 @@ pub struct TimeVal {
 #[cfg(not(target_vendor = "apple"))]
 #[repr(C)]
 pub struct TimeVal {
-    pub sec: c_long,
-    pub usec: c_long,
+    pub sec: std::ffi::c_long,
+    pub usec: std::ffi::c_long,
 }
 
 impl TimeVal {

@@ -56,8 +56,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # pcapdoctor follows Wireshark 4.6's TCP analysis; Ubuntu's own tshark
+      # is older and labels some segments differently.
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libpcap0.8t64 tshark
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libpcap0.8t64 tshark
+          tshark --version | head -1
       - run: cargo build
       - name: Without Npcap, live says where to get it
         if: runner.os == 'Windows'
@@ -68,13 +74,13 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           ./target/debug/pcapdoctor interfaces
-          python3 -m http.server 8000 >/dev/null 2>&1 &
+          python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &
           sleep 1
           sudo ./target/debug/pcapdoctor live -i ${{ matrix.loopback }} -d 5s -w live.pcapng --color never > report.txt &
           capture=$!
           sleep 2
-          curl -s -o /dev/null http://127.0.0.1:8000/
-          curl -s http://127.0.0.1:1/ || true
+          curl -s -m 5 -o /dev/null http://127.0.0.1:8000/ || true
+          curl -s -m 5 http://127.0.0.1:1/ || true
           wait $capture
           cat report.txt
           grep -q "from $(date -u +%Y-%m-%d)" report.txt
@@ -84,7 +90,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           head -c 1000000 /dev/urandom > big.bin
-          python3 -m http.server 8001 >/dev/null 2>&1 &
+          python3 -m http.server 8001 --bind 127.0.0.1 >/dev/null 2>&1 &
           sudo ip link set lo mtu 1500
           sudo tc qdisc add dev lo root netem loss 5% delay 10ms
           sudo ./target/debug/pcapdoctor live -i lo --capture-filter 'tcp port 8001' -w loss.pcapng --color never > loss.txt &
