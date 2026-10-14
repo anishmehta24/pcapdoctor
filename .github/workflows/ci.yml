@@ -20,3 +20,24 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: A check that should pass
+        uses: ./
+        with:
+          captures: examples/*.pcap
+          fail-on: |
+            finding.category == http
+            tcp.analysis.zero_window
+      - name: A check that should fail
+        id: errors
+        continue-on-error: true
+        uses: ./
+        with:
+          captures: examples/demo.pcap
+      - name: The second check failed
+        if: steps.errors.outcome != 'failure'
+        run: exit 1

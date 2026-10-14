@@ -260,6 +260,21 @@ impl TcpConn {
         &self.health[indexes(side).0]
     }
 
+    /// Wireshark's `tcp.analysis.initial_rtt`, in nanoseconds.
+    pub fn initial_rtt_ns(&self) -> Option<u64> {
+        self.analyzer.initial_rtt_ns()
+    }
+
+    /// See [`TcpAnalyzer::last_analyzed`].
+    pub fn last_analyzed(&self) -> bool {
+        self.analyzer.last_analyzed()
+    }
+
+    /// See [`TcpAnalyzer::window_shift`].
+    pub fn window_shift(&self, side: Side) -> u8 {
+        self.analyzer.window_shift(side)
+    }
+
     pub fn handshake_rtt(&self) -> Option<HandshakeRtt> {
         Some(HandshakeRtt {
             total: self.analyzer.initial_rtt()?,
@@ -519,6 +534,12 @@ impl FlowTable {
 
     pub fn get(&self, r: FlowRef) -> &Flow {
         &self.flows[r.index]
+    }
+
+    /// The current flow between two endpoints, if there is one.
+    pub fn find(&self, protocol: u8, a: SocketAddr, b: SocketAddr) -> Option<&Flow> {
+        let index = *self.current.get(&FlowKey::new(protocol, a, b))?;
+        Some(&self.flows[index])
     }
 
     /// Relative-numbering base for a TCP segment; `None` for UDP.

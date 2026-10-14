@@ -34,6 +34,8 @@ pub struct Exchange {
     pub request_end: Option<Arrival>,
     pub response: Option<Response>,
     pub response_start: Option<Arrival>,
+    /// The frame that completed the response head.
+    pub response_frame: Option<u64>,
     /// The response's last byte, once its end has been seen.
     pub response_end: Option<Arrival>,
     /// Response body bytes seen.
@@ -50,6 +52,7 @@ impl Exchange {
             request_end: None,
             response: None,
             response_start: None,
+            response_frame: None,
             response_end: None,
             response_bytes: 0,
         }
@@ -94,6 +97,8 @@ pub enum HttpEvent {
         response: Response,
         /// Frame where the request it answers started.
         request_frame: Option<u64>,
+        /// Target of that request.
+        request_target: Option<String>,
         first_byte: Option<f64>,
     },
 }
@@ -112,6 +117,7 @@ impl fmt::Display for HttpEvent {
                 response,
                 request_frame,
                 first_byte,
+                ..
             } => {
                 write!(
                     f,
@@ -345,10 +351,13 @@ fn read(
             Message::Response(response) if response.status < 200 && response.status != 101 => {
                 // Interim: "100 Continue" and friends; the final response
                 // follows.
-                let request_frame = waiting.front().and_then(|&i| exchanges[i].request_frame);
+                let request = waiting.front().map(|&i| &exchanges[i]);
                 events.push(HttpEvent::Response {
                     response,
-                    request_frame,
+                    request_frame: request.and_then(|e| e.request_frame),
+                    request_target: request
+                        .and_then(|e| e.request.as_ref())
+                        .map(|r| r.target.clone()),
                     first_byte: None,
                 });
                 if stop_both {
@@ -370,9 +379,11 @@ fn read(
                     .flatten();
                 exchange.response = Some(response.clone());
                 exchange.response_start = start;
+                exchange.response_frame = end.map(|a| a.frame);
                 exchange.response_end = if body.is_none() { end } else { None };
                 let first_byte = exchange.time_to_first_byte();
                 let request_frame = exchange.request_frame;
+                let request_target = exchange.request.as_ref().map(|r| r.target.clone());
                 if upgraded || method.as_deref() == Some("CONNECT") && response.status / 100 == 2 {
                     stop_both = true;
                 } else if body.is_some() {
@@ -382,6 +393,7 @@ fn read(
                 events.push(HttpEvent::Response {
                     response,
                     request_frame,
+                    request_target,
                     first_byte,
                 });
                 if stop_both {

@@ -26,6 +26,9 @@ pub enum Link {
         ethertype: u16,
         /// VLAN IDs, outermost first.
         vlans: Vec<u16>,
+        /// The type field after the addresses: `ethertype`, or the tag
+        /// type (0x8100) of the first VLAN tag.
+        outer_type: u16,
     },
     /// Linux "cooked" capture, which is what `tcpdump -i any` writes.
     LinuxCooked,
@@ -76,7 +79,8 @@ fn ethernet(data: &[u8]) -> Result<(Link, Option<u16>, &[u8]), DecodeError> {
     need(data, 14, "Ethernet")?;
     let dst = MacAddr(data[0..6].try_into().unwrap());
     let src = MacAddr(data[6..12].try_into().unwrap());
-    let mut ethertype = be16(data, 12);
+    let outer_type = be16(data, 12);
+    let mut ethertype = outer_type;
     let mut rest = &data[14..];
     let mut vlans = Vec::new();
     // 802.1Q, 802.1ad (QinQ) and the old pre-standard QinQ tag.
@@ -96,6 +100,7 @@ fn ethernet(data: &[u8]) -> Result<(Link, Option<u16>, &[u8]), DecodeError> {
             dst,
             ethertype,
             vlans,
+            outer_type,
         },
         next,
         rest,

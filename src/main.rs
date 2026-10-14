@@ -3,17 +3,24 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use pcapdoctor::analyze::Analyzer;
-use pcapdoctor::capture::{Capture, CaptureError, Frame};
+use pcapdoctor::analyze::{Analyzer, PacketFindings};
+use pcapdoctor::capture::{Capture, CaptureError, Frame, Timestamp};
+use pcapdoctor::decode::Packet;
+use pcapdoctor::diagnose::{Diagnosis, Finding, Severity};
+use pcapdoctor::filter::{self, Filter, PacketView, Target, Tracker, Whole};
 use pcapdoctor::report::{html, json, text};
 use pcapdoctor::stats::{self, Stats};
 use pcapdoctor::{decode, diagnose, summary};
 
 /// Findings shown in text output unless `--all` is given.
 const TEXT_FINDINGS: usize = 30;
+/// Matching packets `check` prints per filter.
+const CHECK_PACKETS: usize = 10;
+/// What `check` fails on when no `--fail-on` is given.
+const DEFAULT_FAIL_ON: &str = "finding.severity == error";
 
 #[derive(Parser)]
 #[command(
@@ -64,13 +71,24 @@ enum ColorWhen {
     Never,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CheckFormat {
+    Text,
+    /// Text, plus annotations for GitHub Actions
+    Github,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Print one line per packet, like tcpdump
     Dump {
         /// Capture file (.pcap or .pcapng)
         file: PathBuf,
-        /// Stop after this many packets
+        /// Only packets that match this filter, in Wireshark's syntax:
+        /// "tcp.port == 443 && !tcp.analysis.flags"
+        #[arg(short = 'f', long, value_name = "FILTER")]
+        filter: Option<String>,
+        /// Stop after printing this many packets
         #[arg(short = 'c', long)]
         count: Option<u64>,
         /// Show raw TCP sequence numbers instead of counting from the start
@@ -86,6 +104,25 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 10)]
         top: usize,
     },
+    /// For CI: exit with status 1 when a capture has problems
+    Check {
+        /// Capture files (.pcap or .pcapng)
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Fail when a finding or packet matches this filter; give it more
+        /// than once to check several things [default: "finding.severity ==
+        /// error"]
+        #[arg(long, value_name = "FILTER")]
+        fail_on: Vec<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = CheckFormat::Text)]
+        format: CheckFormat,
+        /// When to color text output
+        #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
+        color: ColorWhen,
+    },
+    /// List the fields filters can use
+    Fields,
 }
 
 fn main() -> ExitCode {
@@ -93,14 +130,23 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::Dump {
             file,
+            filter,
             count,
             absolute,
-        }) => dump(&file, count, absolute),
-        Some(Command::Stats { file, top }) => stats(&file, top),
-        None => report(cli.report),
+        }) => dump(&file, filter.as_deref(), count, absolute).map(|()| true),
+        Some(Command::Stats { file, top }) => stats(&file, top).map(|()| true),
+        Some(Command::Check {
+            files,
+            fail_on,
+            format,
+            color,
+        }) => check(&files, &fail_on, format, color),
+        Some(Command::Fields) => fields().map(|()| true),
+        None => report(cli.report).map(|()| true),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::from(2)
@@ -108,38 +154,91 @@ fn main() -> ExitCode {
     }
 }
 
-fn dump(path: &Path, count: Option<u64>, absolute: bool) -> Result<()> {
+/// The error shows the filter with a mark under the problem.
+fn parse_filter(text: &str) -> Result<Filter> {
+    Ok(Filter::parse(text)?)
+}
+
+fn dump(path: &Path, filter: Option<&str>, count: Option<u64>, absolute: bool) -> Result<()> {
+    let filter = filter.map(parse_filter).transpose()?;
+    if filter
+        .as_ref()
+        .is_some_and(|f| f.target() == Target::Findings)
+    {
+        bail!("dump -f takes a packet filter; finding.* fields are for check --fail-on");
+    }
+    let whole = match &filter {
+        Some(f) if f.needs_whole_capture() => Some(first_pass(path)?),
+        _ => None,
+    };
     let mut out = BufWriter::new(io::stdout().lock());
     let mut analyzer = Analyzer::new();
+    let mut tracker = Tracker::new(whole);
     let mut first_ts = None;
+    let mut printed = 0;
     let end = read_frames(path, |frame| {
-        if count.is_some_and(|c| frame.number > c) {
+        if count.is_some_and(|c| printed >= c) {
             return Ok(ControlFlow::Break(()));
         }
         let start = *first_ts.get_or_insert(frame.ts);
         let pkt = decode::decode(&frame);
         let found = analyzer.observe(&frame, &pkt);
-        let seq_base = match &found.flow {
-            Some(o) if !absolute => analyzer.flows.seq_base(o.flow),
-            _ => None,
-        };
-        let text = summary::describe_with(&pkt, &found, seq_base);
+        tracker.observe(&frame, &found);
+        if let Some(filter) = &filter
+            && !filter.matches(&PacketView::new(&frame, &pkt, &found, &analyzer, &tracker))
+        {
+            return Ok(ControlFlow::Continue(()));
+        }
         let line = writeln!(
             out,
-            "{:>6} {:>11.6}  {}",
-            frame.number,
-            frame.ts.secs_since(start),
-            text
+            "{}",
+            dump_line(&frame, &pkt, &found, &analyzer, start, absolute)
         );
         if is_broken_pipe(&line) {
             return Ok(ControlFlow::Break(()));
         }
         line?;
+        printed += 1;
         Ok(ControlFlow::Continue(()))
     })?;
     ignore_broken_pipe(out.flush())?;
     end.warn(path);
     Ok(())
+}
+
+fn dump_line(
+    frame: &Frame,
+    pkt: &Packet<'_>,
+    found: &PacketFindings,
+    analyzer: &Analyzer,
+    start: Timestamp,
+    absolute: bool,
+) -> String {
+    let seq_base = match &found.flow {
+        Some(o) if !absolute => analyzer.flows.seq_base(o.flow),
+        _ => None,
+    };
+    format!(
+        "{:>6} {:>11.6}  {}",
+        frame.number,
+        frame.ts.secs_since(start),
+        summary::describe_with(pkt, found, seq_base)
+    )
+}
+
+/// Reads the whole capture once, for filters that need to know what comes
+/// later in it.
+fn first_pass(path: &Path) -> Result<Whole> {
+    let mut analyzer = Analyzer::new();
+    let mut whole = Whole::default();
+    read_frames(path, |frame| {
+        let pkt = decode::decode(&frame);
+        let found = analyzer.observe(&frame, &pkt);
+        whole.observe(&frame, &pkt, &found);
+        Ok(ControlFlow::Continue(()))
+    })?;
+    whole.finish(&analyzer);
+    Ok(whole)
 }
 
 fn stats(path: &Path, top: usize) -> Result<()> {
@@ -157,11 +256,11 @@ fn stats(path: &Path, top: usize) -> Result<()> {
     Ok(())
 }
 
-fn report(args: ReportArgs) -> Result<()> {
-    let path = args.file.expect("clap requires a file");
+/// Reads a capture and diagnoses it.
+fn diagnose_file(path: &Path) -> Result<Diagnosis> {
     let mut stats = Stats::default();
     let mut analyzer = Analyzer::new();
-    let end = read_frames(&path, |frame| {
+    let end = read_frames(path, |frame| {
         let pkt = decode::decode(&frame);
         analyzer.observe(&frame, &pkt);
         stats.add(&frame, &pkt);
@@ -171,7 +270,12 @@ fn report(args: ReportArgs) -> Result<()> {
         End::CutOff { frames } => Some(frames),
         End::Complete => None,
     };
-    let diagnosis = diagnose::diagnose(&stats, &analyzer, cut_off);
+    Ok(diagnose::diagnose(&stats, &analyzer, cut_off))
+}
+
+fn report(args: ReportArgs) -> Result<()> {
+    let path = args.file.expect("clap requires a file");
+    let diagnosis = diagnose_file(&path)?;
     let name = path.display().to_string();
     let body = match args.format {
         Format::Text => text::render(&name, &diagnosis, (!args.all).then_some(TEXT_FINDINGS)),
@@ -186,13 +290,235 @@ fn report(args: ReportArgs) -> Result<()> {
         return std::fs::write(output, body)
             .with_context(|| format!("cannot write {}", output.display()));
     }
-    let choice = match (args.format, args.color) {
-        (Format::Text, ColorWhen::Auto) => anstream::ColorChoice::Auto,
-        (Format::Text, ColorWhen::Always) => anstream::ColorChoice::Always,
-        _ => anstream::ColorChoice::Never,
+    let color = match args.format {
+        Format::Text => args.color,
+        Format::Json | Format::Html => ColorWhen::Never,
+    };
+    write_out(&body, color)
+}
+
+fn write_out(body: &str, color: ColorWhen) -> Result<()> {
+    let choice = match color {
+        ColorWhen::Auto => anstream::ColorChoice::Auto,
+        ColorWhen::Always => anstream::ColorChoice::Always,
+        ColorWhen::Never => anstream::ColorChoice::Never,
     };
     let mut out = anstream::AutoStream::new(io::stdout().lock(), choice);
     ignore_broken_pipe(out.write_all(body.as_bytes()).and_then(|()| out.flush()))
+}
+
+/// What one `--fail-on` filter matched in one capture.
+enum Matched<'a> {
+    Findings(Vec<&'a Finding>),
+    Packets { count: u64, lines: Vec<String> },
+}
+
+impl Matched<'_> {
+    fn count(&self) -> u64 {
+        match self {
+            Matched::Findings(f) => f.len() as u64,
+            Matched::Packets { count, .. } => *count,
+        }
+    }
+}
+
+/// Returns whether every capture passed.
+fn check(
+    files: &[PathBuf],
+    fail_on: &[String],
+    format: CheckFormat,
+    color: ColorWhen,
+) -> Result<bool> {
+    let texts = if fail_on.is_empty() {
+        vec![DEFAULT_FAIL_ON.to_string()]
+    } else {
+        fail_on.to_vec()
+    };
+    let filters: Vec<Filter> = texts
+        .iter()
+        .map(|t| parse_filter(t))
+        .collect::<Result<_>>()?;
+    let mut out = String::new();
+    let mut annotations = String::new();
+    let mut passed = true;
+    let findings_wanted = filters.iter().any(|f| f.target() == Target::Findings);
+    for path in files {
+        let diagnosis = findings_wanted.then(|| diagnose_file(path)).transpose()?;
+        let packets = match_packets(path, &filters)?;
+        let name = path.display().to_string();
+        for (filter, packets) in filters.iter().zip(packets) {
+            let matched = match (packets, &diagnosis) {
+                (Some(packets), _) => packets,
+                (None, Some(diagnosis)) => Matched::Findings(
+                    diagnosis
+                        .findings
+                        .iter()
+                        .filter(|f| filter.matches(*f))
+                        .collect(),
+                ),
+                (None, None) => unreachable!("finding filters come with a diagnosis"),
+            };
+            if matched.count() > 0 {
+                passed = false;
+            }
+            check_text(&mut out, &name, filter, &matched);
+            if format == CheckFormat::Github {
+                github_annotations(&mut annotations, &name, filter, &matched);
+            }
+        }
+    }
+    out.push_str(&annotations);
+    write_out(&out, color)?;
+    Ok(passed)
+}
+
+/// Runs the packet filters over a capture. Returns what each matched, or
+/// `None` for the finding filters.
+fn match_packets(path: &Path, filters: &[Filter]) -> Result<Vec<Option<Matched<'static>>>> {
+    let mut matched: Vec<Option<Matched>> = filters
+        .iter()
+        .map(|f| {
+            (f.target() == Target::Packets).then(|| Matched::Packets {
+                count: 0,
+                lines: Vec::new(),
+            })
+        })
+        .collect();
+    if matched.iter().all(Option::is_none) {
+        return Ok(matched);
+    }
+    let whole = match filters.iter().any(Filter::needs_whole_capture) {
+        true => Some(first_pass(path)?),
+        false => None,
+    };
+    let mut analyzer = Analyzer::new();
+    let mut tracker = Tracker::new(whole);
+    let mut first_ts = None;
+    read_frames(path, |frame| {
+        let start = *first_ts.get_or_insert(frame.ts);
+        let pkt = decode::decode(&frame);
+        let found = analyzer.observe(&frame, &pkt);
+        tracker.observe(&frame, &found);
+        let view = PacketView::new(&frame, &pkt, &found, &analyzer, &tracker);
+        for (filter, matched) in filters.iter().zip(&mut matched) {
+            if let Some(Matched::Packets { count, lines }) = matched
+                && filter.matches(&view)
+            {
+                *count += 1;
+                if lines.len() < CHECK_PACKETS {
+                    lines.push(dump_line(&frame, &pkt, &found, &analyzer, start, false));
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(matched)
+}
+
+fn check_text(out: &mut String, file: &str, filter: &Filter, matched: &Matched<'_>) {
+    use std::fmt::Write as _;
+    let n = matched.count();
+    if n == 0 {
+        let _ = writeln!(out, "{file}: nothing matches {filter}");
+        return;
+    }
+    let what = match matched {
+        Matched::Findings(_) => text::plural(n, "finding", "findings"),
+        Matched::Packets { .. } => text::plural(n, "packet", "packets"),
+    };
+    let verb = if n == 1 { "matches" } else { "match" };
+    let _ = writeln!(out, "{file}: {what} {verb} {filter}");
+    match matched {
+        Matched::Findings(findings) => out.push_str(&text::findings(findings.iter().copied())),
+        Matched::Packets { lines, .. } => {
+            for line in lines {
+                let _ = writeln!(out, "{line}");
+            }
+            let more = n - lines.len() as u64;
+            if more > 0 {
+                let _ = writeln!(
+                    out,
+                    "… {more} more; pcapdoctor dump {file} -f '{filter}' shows them"
+                );
+            }
+        }
+    }
+}
+
+/// Workflow commands that make GitHub show each match as an annotation.
+fn github_annotations(out: &mut String, file: &str, filter: &Filter, matched: &Matched<'_>) {
+    use std::fmt::Write as _;
+    match matched {
+        Matched::Findings(findings) => {
+            for f in findings {
+                let level = match f.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                    Severity::Info => "notice",
+                };
+                let mut message = f.text.clone();
+                if !f.frames.is_empty() {
+                    message = format!("{message} ({})", f.frames_text(4));
+                }
+                if let Some(hint) = &f.hint {
+                    message = format!("{message}\n{hint}");
+                }
+                let title = match f.subject.as_str() {
+                    "" => format!("{} in {file}", f.category.name()),
+                    subject => format!("{} {subject}", f.category.name()),
+                };
+                let _ = writeln!(
+                    out,
+                    "::{level} file={},title={}::{}",
+                    escape_property(file),
+                    escape_property(&title),
+                    escape_data(&message)
+                );
+            }
+        }
+        Matched::Packets { count: 0, .. } => {}
+        Matched::Packets { count, lines } => {
+            let first = lines.first().map(|l| l.trim_start()).unwrap_or_default();
+            let message = format!(
+                "{} {} {filter}, first: {first}",
+                text::plural(*count, "packet", "packets"),
+                if *count == 1 { "matches" } else { "match" },
+            );
+            let _ = writeln!(
+                out,
+                "::error file={},title=pcapdoctor check::{}",
+                escape_property(file),
+                escape_data(&message)
+            );
+        }
+    }
+}
+
+fn escape_data(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn escape_property(s: &str) -> String {
+    escape_data(s).replace(':', "%3A").replace(',', "%2C")
+}
+
+fn fields() -> Result<()> {
+    use std::fmt::Write as _;
+    let mut out = String::from(
+        "Fields for dump -f and check --fail-on. They have Wireshark's names and\n\
+         meanings, so a filter works the same in both.\n\n",
+    );
+    let rows: Vec<_> = filter::all_fields().collect();
+    let width = rows.iter().map(|(name, ..)| name.len()).max().unwrap_or(0);
+    for (name, kind, help) in rows {
+        if name == "finding.severity" {
+            out.push_str("\nFields of findings, for check --fail-on:\n");
+        }
+        let _ = writeln!(out, "{name:<width$}  {:<15}  {help}", kind.describe());
+    }
+    ignore_broken_pipe(io::stdout().lock().write_all(out.as_bytes()))
 }
 
 /// How reading a capture ended.

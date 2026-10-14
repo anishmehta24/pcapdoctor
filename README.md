@@ -16,7 +16,7 @@ examples/demo.pcap: 314 packets over 8.19 s, from 2025-10-09 08:53:20.000 UTC
 ✓ 11 other connections look healthy
 ```
 
-**Status: early.** The diagnosis report works, along with packet listing (`dump`) and capture summaries (`stats`). A filter language and a CI check mode are next; see [PLAN.md](PLAN.md).
+**Status: early.** The diagnosis report, filters and the CI check work, along with packet listing (`dump`) and capture summaries (`stats`). Live capture is next; see [PLAN.md](PLAN.md).
 
 ## Usage
 
@@ -87,6 +87,63 @@ Stream numbers match Wireshark's `tcp.stream` and `udp.stream`, so `tcp.stream =
 Every field, flag and timing above is checked against tshark on real and generated captures. The few places where pcapdoctor differs on purpose are noted in [PLAN.md](PLAN.md).
 
 Reads pcap and pcapng files directly, with no libpcap or Npcap needed. Supported link layers: Ethernet (with VLAN tags), Linux cooked (`tcpdump -i any`), loopback, and raw IP. Cut-off captures are read up to the last complete packet.
+
+## Filters
+
+`dump -f` takes a display filter in Wireshark's syntax, and a filter means the same in both tools:
+
+```
+$ pcapdoctor dump examples/demo.pcap -f 'tcp.analysis.retransmission'
+   206    5.262300  203.0.113.30:443 → 10.0.0.5:50120 TCP [PSH, ACK] seq=8094 ack=589 win=64240 len=1400 [TCP Fast Retransmission]
+   224    5.353800  203.0.113.30:443 → 10.0.0.5:50120 TCP [PSH, ACK] seq=20694 ack=589 win=64240 len=1400 [TCP Fast Retransmission]
+   ...
+```
+
+- Fields have Wireshark's names and types: `ip.addr`, `tcp.port`, `tcp.flags.reset`, `dns.qry.name`, `tls.handshake.extensions_server_name`, `http.response.code`, the `tcp.analysis.*` flags and so on. `pcapdoctor fields` lists all 150.
+- Operators: `==`, `!=`, `>`, `<`, `>=`, `<=`, `contains`, `matches` (a regular expression, ignoring case), `in {80, 443, 8000..8080}`, `&` for bits, and `&&`, `||`, `^^`, `!` (or `and`, `or`, `xor`, `not`). Addresses take networks, as in `ip.addr == 10.0.0.0/8`, and some numbers take names, as in `dns.qry.type == AAAA`. Functions: `lower()`, `upper()`, `len()`, `count()`.
+- The rules are Wireshark's. A field on its own means it is there, so `tcp.flags.syn` matches every TCP packet and `tcp.flags.syn == 1` only SYNs. `!=` matches when no copy of the field is equal: `ip.addr != 10.0.0.1` leaves out packets to and from it.
+- The filters in the report's JSON and HTML are filters like these, so `dump -f` shows the packets behind a finding.
+- Mistakes are caught before the capture is read:
+  ```
+  $ pcapdoctor dump capture.pcap -f 'tcp.flags.rst'
+  error: unknown field "tcp.flags.rst"; did you mean "tcp.flags.reset"?
+    tcp.flags.rst
+    ^~~~~~~~~~~~~
+  ```
+
+Every field is compared with tshark on every packet of 48 captures, and so are the packets that filters pick. The differences are listed in [PLAN.md](PLAN.md).
+
+## In CI
+
+`pcapdoctor check` exits with 1 when a capture has problems, 0 when it hasn't, and 2 when it can't read the capture or the filter:
+
+```
+$ pcapdoctor check examples/demo.pcap
+examples/demo.pcap: 2 findings match finding.severity == error
+✗ DNS   api.internal: name does not exist (NXDOMAIN, asked 3 times)  frames 41-42, 134
+✗ TLS   pay.example.com:443: client rejected the handshake: unknown_ca (the certificate's issuer is not trusted)  frame 84
+        → usually a private CA, or a TLS-inspecting proxy whose CA the client does not have
+```
+
+`--fail-on` says what fails, and can be given more than once. It takes a packet filter, or a filter on the report's findings: `finding.severity`, `finding.category`, `finding.text`, and the numbers behind each finding, such as `finding.server_secs` or `finding.retransmission_rate`.
+
+```
+pcapdoctor check capture.pcap \
+  --fail-on 'finding.severity >= warning && finding.category != slow' \
+  --fail-on 'finding.server_secs > 1' \
+  --fail-on 'tcp.analysis.zero_window'
+```
+
+In GitHub Actions:
+
+```yaml
+- uses: anishmehta24/pcapdoctor@main
+  with:
+    captures: captures/*.pcapng
+    fail-on: finding.severity == error
+```
+
+Each finding becomes an annotation on the run, and the report goes to the job summary. Until there are release binaries, the action builds pcapdoctor from source, which takes about a minute.
 
 ## Getting a capture
 

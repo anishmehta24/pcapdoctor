@@ -94,7 +94,8 @@ pub struct ClientHello {
     pub server_name: Option<String>,
     /// Application protocols offered (ALPN), e.g. "h2", "http/1.1".
     pub alpn: Vec<String>,
-    /// From the supported_versions extension, sent by TLS 1.3 clients.
+    /// From the supported_versions extension, sent by TLS 1.3 clients,
+    /// including any GREASE values.
     pub supported_versions: Vec<u16>,
     pub cipher_suites: Vec<u16>,
 }
@@ -105,6 +106,7 @@ impl ClientHello {
         self.supported_versions
             .iter()
             .copied()
+            .filter(|v| !is_grease(*v))
             .max()
             .unwrap_or(self.legacy_version)
     }
@@ -176,11 +178,8 @@ pub fn parse_client_hello(body: &[u8]) -> Result<ClientHello, TlsError> {
                 let (versions, _) = Reader::new(data, "supported versions")
                     .vec8()?
                     .as_chunks::<2>();
-                hello.supported_versions = versions
-                    .iter()
-                    .map(|v| u16::from_be_bytes(*v))
-                    .filter(|v| !is_grease(*v))
-                    .collect();
+                hello.supported_versions =
+                    versions.iter().map(|v| u16::from_be_bytes(*v)).collect();
             }
             _ => {}
         }
@@ -443,7 +442,7 @@ mod tests {
         let hello = parse_client_hello(&client_hello()).unwrap();
         assert_eq!(hello.server_name.as_deref(), Some("api.example.com"));
         assert_eq!(hello.alpn, vec!["h2", "http/1.1"]);
-        assert_eq!(hello.supported_versions, vec![0x0304, 0x0303]);
+        assert_eq!(hello.supported_versions, vec![0x5a5a, 0x0304, 0x0303]);
         assert_eq!(hello.max_version(), TLS_1_3);
         assert_eq!(hello.cipher_suites, vec![0x1301, 0xc02f]);
     }

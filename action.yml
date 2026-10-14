@@ -1,0 +1,55 @@
+name: pcapdoctor check
+description: Fail the job when a packet capture shows network problems
+branding:
+  icon: activity
+  color: red
+
+inputs:
+  captures:
+    description: Capture files to check, separated by spaces or newlines; globs work
+    required: true
+  fail-on:
+    description: Filters to fail on, one per line (packet fields or finding.*)
+    default: finding.severity == error
+
+runs:
+  using: composite
+  steps:
+    # There are no release binaries yet, so build from this action's source.
+    - name: Build pcapdoctor
+      shell: bash
+      run: |
+        if [ ! -e "$RUNNER_TEMP/pcapdoctor/.crates.toml" ]; then
+          cargo install --locked --quiet --path "$GITHUB_ACTION_PATH" --root "$RUNNER_TEMP/pcapdoctor"
+        fi
+
+    - name: Check captures
+      shell: bash
+      env:
+        CAPTURES: ${{ inputs.captures }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        bin="$RUNNER_TEMP/pcapdoctor/bin/pcapdoctor"
+        args=()
+        while IFS= read -r filter; do
+          [ -n "$filter" ] && args+=(--fail-on "$filter")
+        done <<< "$FAIL_ON"
+        set -f
+        patterns=($CAPTURES)
+        set +f
+        shopt -s nullglob
+        files=()
+        for pattern in "${patterns[@]}"; do
+          matched=($pattern)
+          if [ ${#matched[@]} -eq 0 ]; then
+            echo "::error::no capture matches $pattern"
+            exit 2
+          fi
+          files+=("${matched[@]}")
+        done
+        status=0
+        "$bin" check "${files[@]}" "${args[@]}" --format github --color never || status=$?
+        for file in "${files[@]}"; do
+          printf '```\n%s\n```\n' "$("$bin" "$file" --color never)" >> "$GITHUB_STEP_SUMMARY"
+        done
+        exit $status

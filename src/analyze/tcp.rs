@@ -273,6 +273,9 @@ struct Direction {
     unacked: Vec<Unacked>,
     /// Events of the last segment (as bits).
     last_events: u16,
+    /// Wireshark counts this side's bytes in flight once the other side has
+    /// sent an ACK, and stops after a gap until the next one.
+    counts_in_flight: bool,
 }
 
 impl Direction {
@@ -290,12 +293,37 @@ pub struct TcpAnalyzer {
     /// From the most recent SYN to the first ACK after it; Wireshark's
     /// `tcp.analysis.initial_rtt`.
     initial_rtt_ns: Option<u64>,
+    /// The last segment acknowledged one of the other side's segments, which
+    /// Wireshark shows as "This is an ACK to the segment in frame N".
+    acked_segment: bool,
+    /// The last segment had something for Wireshark's SEQ/ACK analysis tree.
+    analyzed: bool,
 }
 
 impl TcpAnalyzer {
     /// Initial round-trip time in seconds.
     pub fn initial_rtt(&self) -> Option<f64> {
         self.initial_rtt_ns.map(|ns| ns as f64 / 1e9)
+    }
+
+    pub fn initial_rtt_ns(&self) -> Option<u64> {
+        self.initial_rtt_ns
+    }
+
+    /// Whether Wireshark gives the last segment a SEQ/ACK analysis tree: it
+    /// acknowledged a segment, carried data counted in flight, or got a
+    /// flag. Fields such as `tcp.analysis.initial_rtt` are only shown there.
+    pub fn last_analyzed(&self) -> bool {
+        self.analyzed
+    }
+
+    /// How far `side`'s window field is shifted: what Wireshark multiplies
+    /// it by for `tcp.window_size`. 0 unless the handshake turned scaling on.
+    pub fn window_shift(&self, side: Side) -> u8 {
+        match self.dirs[side_index(side)].scale {
+            WindowScale::Shift(shift) => shift,
+            WindowScale::Unknown | WindowScale::Off => 0,
+        }
     }
 
     /// Analyzes one segment sent by `side`.
@@ -318,6 +346,8 @@ impl TcpAnalyzer {
                 of_frame: fwd.last_non_dup_ack_frame,
             });
         }
+        let in_flight = tcp.payload_len > 0 && self.dirs[own].counts_in_flight;
+        self.analyzed = self.acked_segment || in_flight || !events.list.is_empty();
         events.list
     }
 
@@ -333,6 +363,9 @@ impl TcpAnalyzer {
         let syn_or_fin = flags.has(TcpFlags::SYN) || flags.has(TcpFlags::FIN);
         let control = syn_or_fin || flags.has(TcpFlags::RST);
         let mut ev = Events::default();
+        if flags.has(TcpFlags::ACK) {
+            rev.counts_in_flight = true;
+        }
 
         'fwd: {
             if len == 1 && fwd.next_seq == Some(seq) && rev.window == Some(0) {
@@ -347,6 +380,7 @@ impl TcpAnalyzer {
                 && !flags.has(TcpFlags::RST)
             {
                 ev.add(TcpEvent::PreviousSegmentNotCaptured);
+                fwd.counts_in_flight = false;
             }
             if len <= 1 && fwd.next_seq.is_some_and(|n| seq == n.wrapping_sub(1)) && !control {
                 ev.add(TcpEvent::KeepAlive);
@@ -457,6 +491,12 @@ impl TcpAnalyzer {
         fwd.last_ack = Some(ack);
         fwd.last_ack_ts = ts;
         fwd.last_events = ev.bits;
+        // Wireshark looks for the segments this acknowledges, wholly or in
+        // part, whatever the flags.
+        self.acked_segment = rev
+            .unacked
+            .iter()
+            .any(|u| seq_gt(ack, u.seq) && !seq_gt(ack, u.end));
         if flags.has(TcpFlags::ACK) {
             drop_acked(&mut rev.unacked, ack);
         }

@@ -23,6 +23,27 @@ use crate::units;
 /// cut off by the end of the capture.
 pub const GIVE_UP_SECS: f64 = 3.0;
 
+/// Every measurement a finding can carry. Names ending in `_secs` are
+/// durations and `_rate` fractions; the rest are counts.
+pub const MEASUREMENTS: &[&str] = &[
+    "attempts",
+    "connections",
+    "handshakes",
+    "lookups",
+    "network_rtt_secs",
+    "packets",
+    "queries",
+    "requests",
+    "retransmission_rate",
+    "retransmissions",
+    "segments",
+    "server_secs",
+    "slowest_secs",
+    "wait_secs",
+    "window_full",
+    "zero_windows",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Worth knowing, but not a fault.
@@ -34,6 +55,8 @@ pub enum Severity {
 }
 
 impl Severity {
+    pub const ALL: [Severity; 3] = [Severity::Info, Severity::Warning, Severity::Error];
+
     pub fn name(self) -> &'static str {
         match self {
             Severity::Info => "info",
@@ -59,6 +82,16 @@ pub enum Category {
 }
 
 impl Category {
+    pub const ALL: [Category; 7] = [
+        Category::Dns,
+        Category::Tcp,
+        Category::Loss,
+        Category::Slow,
+        Category::Tls,
+        Category::Http,
+        Category::Capture,
+    ];
+
     /// Short label for reports.
     pub fn name(self) -> &'static str {
         match self {
@@ -171,6 +204,10 @@ impl Finding {
     }
 
     fn measure(mut self, name: &'static str, value: f64) -> Self {
+        debug_assert!(
+            MEASUREMENTS.contains(&name),
+            "{name} is not in MEASUREMENTS"
+        );
         self.measurements.push(Measurement { name, value });
         self
     }

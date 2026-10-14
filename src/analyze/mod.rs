@@ -15,7 +15,7 @@ use crate::flow::{FlowTable, Observed};
 
 use self::dns::{DnsLog, DnsPacket};
 use self::http::{HttpEvent, HttpLog};
-use self::tls::{TlsEvent, TlsLog};
+use self::tls::{TlsEvent, TlsLog, TlsRecord};
 
 /// Everything the analysis keeps from packet to packet.
 #[derive(Debug, Default)]
@@ -34,6 +34,8 @@ pub struct PacketFindings {
     pub flow: Option<Observed>,
     pub dns: DnsPacket,
     pub tls: Vec<TlsEvent>,
+    /// TLS records that ended in this packet.
+    pub tls_records: Vec<TlsRecord>,
     pub http: Vec<HttpEvent>,
 }
 
@@ -46,9 +48,12 @@ impl Analyzer {
         let flow = self.flows.observe(frame, pkt);
         let dns = self.dns.observe(frame, pkt, flow.as_ref());
         let mut tls = Vec::new();
+        let mut tls_records = Vec::new();
         let mut http = Vec::new();
         if let (Some(Transport::Tcp(tcp)), Some(observed)) = (&pkt.transport, &flow) {
-            tls = self.tls.observe(frame, tcp, pkt.payload, observed);
+            let seen = self.tls.observe(frame, tcp, pkt.payload, observed);
+            tls = seen.events;
+            tls_records = seen.records;
             http = self.http.observe(frame, tcp, pkt.payload, observed);
             for event in &tls {
                 if let TlsEvent::ClientHello(hello) = event
@@ -63,6 +68,7 @@ impl Analyzer {
             flow,
             dns,
             tls,
+            tls_records,
             http,
         }
     }

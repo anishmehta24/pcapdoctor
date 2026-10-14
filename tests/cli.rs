@@ -197,3 +197,174 @@ fn stats_lists_conversations() {
         "{row}"
     );
 }
+
+const DEMO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.pcap");
+
+fn pcapdoctor(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_pcapdoctor"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+fn frames(stdout: &str) -> Vec<u64> {
+    stdout
+        .lines()
+        .map(|l| l.split_whitespace().next().unwrap().parse().unwrap())
+        .collect()
+}
+
+#[test]
+fn dump_filter_selects_packets() {
+    let out = run(
+        "filter",
+        &handshake().bytes(),
+        &["dump", "-f", "tcp.flags.syn == 1"],
+    );
+    assert!(out.status.success());
+    assert_eq!(frames(&String::from_utf8(out.stdout).unwrap()), vec![1, 2]);
+
+    let (code, stdout, _) = pcapdoctor(&["dump", DEMO, "-f", "tcp.analysis.retransmission"]);
+    assert_eq!(code, 0);
+    assert_eq!(frames(&stdout), vec![206, 224, 243, 261]);
+    // -c counts printed packets.
+    let (_, stdout, _) = pcapdoctor(&["dump", DEMO, "-f", "dns", "-c", "2"]);
+    assert_eq!(frames(&stdout).len(), 2);
+    // A field pointing forward needs a second pass.
+    let (_, stdout, _) = pcapdoctor(&["dump", DEMO, "-f", "dns.flags.rcode == 3"]);
+    assert_eq!(frames(&stdout), vec![41, 42, 134]);
+    let (_, stdout, _) = pcapdoctor(&["dump", DEMO, "-f", "dns.response_in == 41"]);
+    assert_eq!(frames(&stdout).len(), 1);
+}
+
+#[test]
+fn bad_filters_exit_with_2_and_show_where() {
+    let (code, stdout, stderr) = pcapdoctor(&["dump", DEMO, "-f", "tcp.flags.rst"]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        "error: unknown field \"tcp.flags.rst\"; did you mean \"tcp.flags.reset\"?\n  tcp.flags.rst\n  ^~~~~~~~~~~~~\n"
+    );
+    let (code, _, stderr) = pcapdoctor(&["dump", DEMO, "-f", "finding.severity == error"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("check --fail-on"), "{stderr}");
+    let (code, _, _) = pcapdoctor(&["check", DEMO, "--fail-on", "tcp.port =="]);
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn check_fails_on_errors_by_default() {
+    let (code, stdout, _) = pcapdoctor(&["check", DEMO, "--color", "never"]);
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("{DEMO}: 2 findings match finding.severity == error")
+    );
+    assert!(lines[1].starts_with("✗ DNS   api.internal: name does not exist"));
+    assert!(lines[2].starts_with("✗ TLS   pay.example.com:443: client rejected"));
+}
+
+#[test]
+fn check_passes_when_nothing_matches() {
+    let (code, stdout, _) = pcapdoctor(&[
+        "check",
+        DEMO,
+        "--fail-on",
+        "finding.category == http",
+        "--fail-on",
+        "tcp.analysis.zero_window",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(
+        stdout,
+        format!(
+            "{DEMO}: nothing matches finding.category == http\n\
+             {DEMO}: nothing matches tcp.analysis.zero_window\n"
+        )
+    );
+}
+
+#[test]
+fn check_on_packets_and_measurements() {
+    let (code, stdout, _) = pcapdoctor(&[
+        "check",
+        DEMO,
+        "--color",
+        "never",
+        "--fail-on",
+        "tcp.analysis.fast_retransmission",
+        "--fail-on",
+        "finding.retransmission_rate > 0.05",
+    ]);
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("{DEMO}: 4 packets match tcp.analysis.fast_retransmission")
+    );
+    assert!(lines[1].starts_with("   206 "), "{}", lines[1]);
+    assert!(lines[1].ends_with("[TCP Fast Retransmission]"));
+    assert_eq!(
+        lines[5],
+        format!("{DEMO}: 1 finding matches finding.retransmission_rate > 0.05")
+    );
+    assert!(lines[6].starts_with("⚠ LOSS"));
+}
+
+#[test]
+fn check_annotates_for_github() {
+    let (code, stdout, _) = pcapdoctor(&["check", DEMO, "--format", "github", "--color", "never"]);
+    assert_eq!(code, 1);
+    let annotations: Vec<&str> = stdout.lines().filter(|l| l.starts_with("::")).collect();
+    assert_eq!(annotations.len(), 2, "{stdout}");
+    let file = DEMO.replace(':', "%3A");
+    assert_eq!(
+        annotations[0],
+        format!(
+            "::error file={file},title=DNS api.internal::name does not exist (NXDOMAIN, asked 3 times) (frames 41-42, 134)"
+        )
+    );
+    assert!(
+        annotations[1].contains("%0Ausually a private CA"),
+        "{}",
+        annotations[1]
+    );
+}
+
+#[test]
+fn fields_lists_packet_and_finding_fields() {
+    let (code, stdout, _) = pcapdoctor(&["fields"]);
+    assert_eq!(code, 0);
+    assert!(stdout.lines().any(|l| l.starts_with("tcp.port ")));
+    assert!(stdout.lines().any(|l| l.starts_with("finding.severity ")));
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("finding.server_secs "))
+    );
+}
+
+#[test]
+fn readme_shows_real_check_output() {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = readme
+        .split("$ pcapdoctor check examples/demo.pcap\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("README shows a check example");
+    let out = Command::new(env!("CARGO_BIN_EXE_pcapdoctor"))
+        .args(["check", "examples/demo.pcap", "--color", "never"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), block);
+}

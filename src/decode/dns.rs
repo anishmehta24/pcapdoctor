@@ -42,6 +42,10 @@ pub struct Message {
     pub rcode: u8,
     pub questions: Vec<Question>,
     pub answers: Vec<Record>,
+    /// The authority and additional sections, as far as they could be read.
+    /// Damage there isn't an error: the answers are what matter.
+    pub authorities: Vec<Record>,
+    pub additionals: Vec<Record>,
     /// Answer count from the header. More than `answers.len()` when the
     /// answers are damaged or were cut off by the capture.
     pub answer_count: u16,
@@ -138,6 +142,8 @@ fn parse_parts(data: &[u8]) -> Result<(Message, Option<DnsError>), DnsError> {
         rcode: (flags & 0x000f) as u8,
         questions: Vec::new(),
         answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
         answer_count: be16(data, 6),
         authority_count: be16(data, 8),
         additional_count: be16(data, 10),
@@ -161,7 +167,22 @@ fn parse_parts(data: &[u8]) -> Result<(Message, Option<DnsError>), DnsError> {
             }
             Err(e) => {
                 msg.error = Some(e);
-                break;
+                return Ok((msg, None));
+            }
+        }
+    }
+    let sections = [
+        (msg.authority_count, &mut msg.authorities),
+        (msg.additional_count, &mut msg.additionals),
+    ];
+    'sections: for (count, records) in sections {
+        for _ in 0..count {
+            match read_record(data, pos) {
+                Ok((record, next)) => {
+                    records.push(record);
+                    pos = next;
+                }
+                Err(_) => break 'sections,
             }
         }
     }

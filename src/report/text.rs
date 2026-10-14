@@ -35,14 +35,38 @@ pub fn render(file: &str, diagnosis: &Diagnosis, max: Option<usize>) -> String {
     out.push('\n');
 
     let shown = &diagnosis.findings[..max.unwrap_or(usize::MAX).min(diagnosis.findings.len())];
-    let lines: Vec<String> = shown.iter().map(headline).collect();
+    out.push_str(&findings(shown.iter()));
+    let hidden = diagnosis.findings.len() - shown.len();
+    if hidden > 0 {
+        let _ = writeln!(
+            out,
+            "{}… {} more; --all shows them{}",
+            dim.render(),
+            plural(hidden as u64, "finding", "findings"),
+            dim.render_reset()
+        );
+    }
+    if let Some(line) = healthy_line(diagnosis) {
+        let green = Style::new().fg_color(Some(AnsiColor::Green.into()));
+        let _ = writeln!(out, "{}✓{} {line}", green.render(), green.render_reset());
+    }
+    out
+}
+
+/// One line per finding, with the frames lined up on the right, and the
+/// hint below when there is one.
+pub fn findings<'a>(findings: impl Iterator<Item = &'a Finding>) -> String {
+    let dim = Style::new().dimmed();
+    let findings: Vec<&Finding> = findings.collect();
+    let lines: Vec<String> = findings.iter().map(|f| headline(f)).collect();
     let width = lines
         .iter()
         .map(|l| l.chars().count())
         .filter(|&w| w <= MAX_ALIGN)
         .max()
         .unwrap_or(0);
-    for (finding, line) in shown.iter().zip(&lines) {
+    let mut out = String::new();
+    for (finding, line) in findings.iter().zip(&lines) {
         let style = severity_style(finding.severity);
         let (glyph, rest) =
             line.split_at(line.char_indices().nth(1).map_or(line.len(), |(i, _)| i));
@@ -68,20 +92,6 @@ pub fn render(file: &str, diagnosis: &Diagnosis, max: Option<usize>) -> String {
         if let Some(hint) = &finding.hint {
             let _ = writeln!(out, "        → {hint}");
         }
-    }
-    let hidden = diagnosis.findings.len() - shown.len();
-    if hidden > 0 {
-        let _ = writeln!(
-            out,
-            "{}… {} more; --all shows them{}",
-            dim.render(),
-            plural(hidden as u64, "finding", "findings"),
-            dim.render_reset()
-        );
-    }
-    if let Some(line) = healthy_line(diagnosis) {
-        let green = Style::new().fg_color(Some(AnsiColor::Green.into()));
-        let _ = writeln!(out, "{}✓{} {line}", green.render(), green.render_reset());
     }
     out
 }
@@ -148,6 +158,6 @@ fn healthy_line(diagnosis: &Diagnosis) -> Option<String> {
     Some(format!("{} {verb} healthy", plural(n, one, many)))
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
+pub fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{} {}", units::count(n), if n == 1 { one } else { many })
 }

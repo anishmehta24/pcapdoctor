@@ -38,7 +38,8 @@ Who it's for: support engineers handed a customer's capture, backend developers 
 | `pcapdoctor dump FILE -f FILTER` | same, filtered | M7 |
 | `pcapdoctor stats FILE [-n N]` | protocol mix, busiest hosts, conversations | M2 |
 | `pcapdoctor FILE [--format text\|json\|html] [-o PATH] [--all]` | diagnosis report (default command) | M6 |
-| `pcapdoctor check FILE --fail-on FILTER` | CI mode: exit 1 when something matches | M7 |
+| `pcapdoctor check FILE... [--fail-on FILTER]...` | CI mode: exit 1 when something matches | M7 |
+| `pcapdoctor fields` | the fields filters can use | M7 |
 | `pcapdoctor live -i IFACE -d 30s` | capture, then diagnose | M8 |
 
 Exit codes: 0 ok, 1 `check` found problems, 2 error.
@@ -153,11 +154,27 @@ Cargo project, CLI skeleton, CI (fmt, clippy, tests on Linux, Windows and macOS)
     - A reset already explained by a TLS or HTTP failure isn't reported again.
     - On connections captured in one direction only, missing answers aren't reported: they may have been sent.
 
-### M7 Filter language and CI mode
-- Wireshark-style syntax: `tcp.port == 443 && !(ip.src == 10.0.0.0/8)`, `dns.rcode != 0`, `tcp.flags.rst`, `tls.sni contains "api"`
+### M7 Filter language and CI mode — done 2026-10-14
+- Wireshark-style syntax: `tcp.port == 443 && !(ip.src == 10.0.0.0/8)`, `dns.flags.rcode != 0`, `tcp.flags.reset == 1`, `tls.handshake.extensions_server_name contains "api"`
 - Tokenizer → recursive-descent parser → AST → evaluator; error messages point at the column
 - `dump -f`, and `check --fail-on` for packets and findings (`finding.severity == error`)
 - GitHub Action wrapper
+- **Status:**
+  - The syntax and rules are Wireshark 4.6's, each checked with tshark: a field on its own tests that it is there; `==` matches any copy of a field and `!=` needs every copy to differ; a missing field matches no comparison; `&&` binds tighter than `^^`, and `^^` tighter than `||`; `matches` ignores case; sets need commas; numbers can be hex or octal, and some take Wireshark's names (`dns.qry.type == AAAA`, `dns.flags.rcode == "No such name"`, from `tshark -G values`).
+  - 150 packet fields with Wireshark's names and types, listed by `pcapdoctor fields`. An ICMP error carries the fields of the packet it quotes, as in Wireshark: an unreachable DNS query matches `udp.port == 53` and `dns.qry.name`.
+  - Fields that point forward in the capture (`dns.response_in`, `http.response_in`, and `tcp.analysis.initial_rtt`, which Wireshark already shows on the SYN-ACK) make pcapdoctor read the capture twice. So do the other DNS transaction fields: they follow Wireshark's matching, where a query sent again after 5 seconds starts a new transaction. The report keeps its own lookups, which count from the first try.
+  - Checked against tshark:
+    - Every field on every packet of 48 captures (4,589 packets, 688,000 values): 368 values differ, all in the cases below.
+    - Every filter the report prints, 71 across those captures: each picks the same packets in both tools.
+    - 80 filters that use every operator and function, on all 48 captures: of 3,840 runs, 19 pick different packets, all in the cases below.
+    - `tests/fixtures/filters.tshark.txt` holds tshark's answers for 431 filters on the captures in this repository, including the report's, so CI checks them without tshark. A test fails when a finding's filter is missing from it.
+  - Differences from Wireshark:
+    - HTTP fields are on the frame that ends the headers, as in Wireshark with "Reassemble HTTP bodies" off. In that mode Wireshark also marks body frames as "Continuation" and sometimes loses track of a response after a body; pcapdoctor does neither. With its default settings Wireshark shows HTTP on the frame that ends the body.
+    - Wireshark links pipelined responses to their requests only when the requests came in separate segments; pcapdoctor always does.
+    - Wireshark finds DNS on any UDP port no other protocol claims. pcapdoctor reads DNS on port 53, and mDNS and LLMNR on 5353 and 5355.
+    - TLS is recognized from the ClientHello, so the records of a connection that started before the capture aren't TLS to pcapdoctor; Wireshark goes by port 443. SSLv2-format hellos aren't read (M5).
+    - Wireshark still shows the type and address of a DNS record whose name is broken.
+  - `check` exits with 1 when any `--fail-on` filter matches, 0 when none does, and 2 on errors. The default is `finding.severity == error`. `--format github` adds workflow annotations. `action.yml` builds pcapdoctor and runs `check`; CI runs it on the demo capture both ways.
 
 ### M8 Live capture
 - `pcap` crate behind a `live` cargo feature (libpcap on Linux/macOS, Npcap on Windows)

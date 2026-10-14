@@ -361,6 +361,28 @@ impl fmt::Display for TlsEvent {
     }
 }
 
+/// A TLS record, in the frame that completed it, which is where Wireshark
+/// shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsRecord {
+    pub content_type: u8,
+    /// In TLS 1.3 the outer type of an encrypted record is a placeholder,
+    /// which Wireshark calls the opaque type.
+    pub opaque: bool,
+    pub version: u16,
+    pub length: u16,
+    /// Handshake messages that ended in this record. Empty once the
+    /// handshake is encrypted.
+    pub handshake_types: Vec<u8>,
+}
+
+/// What one TCP segment completed.
+#[derive(Debug, Default)]
+pub struct TlsSeen {
+    pub events: Vec<TlsEvent>,
+    pub records: Vec<TlsRecord>,
+}
+
 /// Where we are in one direction of a connection.
 #[derive(Debug, Default)]
 struct Direction {
@@ -406,7 +428,7 @@ impl TlsLog {
         tcp: &Tcp,
         payload: &[u8],
         flow: &Observed,
-    ) -> Vec<TlsEvent> {
+    ) -> TlsSeen {
         let index = flow.flow.index;
         let side = flow.flow.from;
         let at = Arrival {
@@ -418,7 +440,7 @@ impl TlsLog {
             .entry(index)
             .or_insert_with(|| Connection::Undecided(Default::default()));
         if matches!(connection, Connection::NotTls) {
-            return Vec::new();
+            return TlsSeen::default();
         }
         let dirs = match connection {
             Connection::Undecided(dirs) | Connection::Tls(_, dirs) => dirs,
@@ -426,7 +448,7 @@ impl TlsLog {
         };
         let own = side_index(side);
         if dirs[own].bytes.push(tcp, payload, at, BUFFER_LIMIT) == 0 {
-            return Vec::new();
+            return TlsSeen::default();
         }
         if let Connection::Undecided(dirs) = connection {
             // TLS starts with the client's ClientHello, or with a server alert
@@ -434,7 +456,7 @@ impl TlsLog {
             // the handshake type, which may come a byte at a time.
             let data = dirs[own].bytes.data();
             if data.len() < 6 && dirs[own].bytes.is_following() {
-                return Vec::new();
+                return TlsSeen::default();
             }
             let tls = match (side, tls::record_header(data)) {
                 (Side::Client, Some(h)) => {
@@ -445,14 +467,14 @@ impl TlsLog {
             };
             if !tls {
                 *connection = Connection::NotTls;
-                return Vec::new();
+                return TlsSeen::default();
             }
             let dirs = std::mem::take(dirs);
             self.handshakes.push(Handshake::new(index));
             *connection = Connection::Tls(self.handshakes.len() - 1, dirs);
         }
         let Connection::Tls(handshake, dirs) = connection else {
-            return Vec::new();
+            return TlsSeen::default();
         };
         let handshake = &mut self.handshakes[*handshake];
         read_records(handshake, dirs, side)
@@ -460,8 +482,8 @@ impl TlsLog {
 }
 
 /// Reads every complete record that `side` has sent so far.
-fn read_records(handshake: &mut Handshake, dirs: &mut [Direction; 2], side: Side) -> Vec<TlsEvent> {
-    let mut events = Vec::new();
+fn read_records(handshake: &mut Handshake, dirs: &mut [Direction; 2], side: Side) -> TlsSeen {
+    let mut seen = TlsSeen::default();
     let own = side_index(side);
     loop {
         let dir = &mut dirs[own];
@@ -483,6 +505,7 @@ fn read_records(handshake: &mut Handshake, dirs: &mut [Direction; 2], side: Side
             .arrival(end - 1)
             .expect("the record's last byte is buffered");
         dir.bytes.consume(5 + header.len);
+        let mut handshake_types = Vec::new();
         record(
             handshake,
             dirs,
@@ -490,16 +513,34 @@ fn read_records(handshake: &mut Handshake, dirs: &mut [Direction; 2], side: Side
             header.content_type,
             &body,
             at,
-            &mut events,
+            &mut seen.events,
+            &mut handshake_types,
         );
+        // Application data before the ServerHello, on a connection that
+        // offers TLS 1.3, is 0-RTT early data: encrypted the same way.
+        let early_data = side == Side::Client
+            && handshake.server_hello.is_none()
+            && handshake
+                .client_hello
+                .as_ref()
+                .is_some_and(|(_, hello)| tls::is_tls13(hello.max_version()));
+        let tls13 = early_data || handshake.version().is_some_and(tls::is_tls13);
+        seen.records.push(TlsRecord {
+            content_type: header.content_type,
+            opaque: tls13 && header.content_type == tls::APPLICATION_DATA,
+            version: header.version,
+            length: header.len as u16,
+            handshake_types,
+        });
         if handshake.error.is_some() {
             dirs[own].bytes.stop();
             break;
         }
     }
-    events
+    seen
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     handshake: &mut Handshake,
     dirs: &mut [Direction; 2],
@@ -508,6 +549,7 @@ fn record(
     body: &[u8],
     at: Arrival,
     events: &mut Vec<TlsEvent>,
+    handshake_types: &mut Vec<u8>,
 ) {
     let own = side_index(side);
     let tls13 = handshake.version().is_some_and(tls::is_tls13);
@@ -542,6 +584,7 @@ fn record(
             while let Some((kind, msg, len)) = tls::handshake_message(&dirs[own].handshake) {
                 let msg = msg.to_vec();
                 dirs[own].handshake.drain(..len);
+                handshake_types.push(kind);
                 handshake_message(handshake, dirs, side, kind, &msg, at, events);
                 if handshake.error.is_some() {
                     return;

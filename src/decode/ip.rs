@@ -26,6 +26,9 @@ pub struct Ipv6 {
     pub src: Ipv6Addr,
     pub dst: Ipv6Addr,
     pub hop_limit: u8,
+    /// Next header field of the fixed header: the first extension header,
+    /// or the same as `protocol` when there are none.
+    pub next_header: u8,
     /// Protocol after any extension headers (6 TCP, 17 UDP, 58 ICMPv6).
     pub protocol: u8,
     pub payload_len: u16,
@@ -157,6 +160,7 @@ pub(super) fn decode_v6(data: &[u8], missing: usize) -> Result<(Ipv6, &[u8], usi
         src: addr(&data[8..24]),
         dst: addr(&data[24..40]),
         hop_limit: data[7],
+        next_header: data[6],
         protocol: next,
         payload_len,
         fragment,

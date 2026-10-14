@@ -47,6 +47,18 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
     /// Why decoding stopped early, if it did.
     pub error: Option<DecodeError>,
+    /// Where the layers start in the captured bytes.
+    pub offsets: Offsets,
+}
+
+/// Byte offsets into the frame, for filters that search a layer's bytes
+/// (`tcp contains "GET"`). Only meaningful for the layers that were decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Offsets {
+    pub network: usize,
+    pub transport: usize,
+    /// End of the IP packet; Ethernet padding and trailers come after it.
+    pub end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +89,10 @@ pub enum Transport {
 }
 
 /// The start of the packet an ICMP error is about, which the error quotes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quoted<'a> {
+    /// The quoted IP header.
+    pub header: Network,
     pub protocol: u8,
     pub src: IpAddr,
     pub dst: IpAddr,
@@ -86,6 +100,8 @@ pub struct Quoted<'a> {
     pub ports: Option<(u16, u16)>,
     /// Whatever was quoted after the UDP header; empty for other protocols.
     pub udp_payload: &'a [u8],
+    /// Everything quoted after the IP header.
+    pub transport: &'a [u8],
 }
 
 impl<'a> Packet<'a> {
@@ -105,18 +121,24 @@ impl<'a> Packet<'a> {
         }
         // The rest of the 8-byte ICMP header, then the original IP packet.
         let inner = self.payload.get(4..)?;
-        let (src, dst, protocol, rest): (IpAddr, IpAddr, u8, &[u8]) = match inner.first()? >> 4 {
+        let (header, rest) = match inner.first()? >> 4 {
             4 => {
                 let (h, rest, _) = ip::decode_v4(inner, 0).ok()?;
                 if h.fragment_offset != 0 {
                     return None;
                 }
-                (h.src.into(), h.dst.into(), h.protocol, rest)
+                (Network::Ipv4(h), rest)
             }
             6 => {
                 let (h, rest, _) = ip::decode_v6(inner, 0).ok()?;
-                (h.src.into(), h.dst.into(), h.protocol, rest)
+                (Network::Ipv6(h), rest)
             }
+            _ => return None,
+        };
+        let (src, dst) = header.ip_addrs()?;
+        let protocol = match &header {
+            Network::Ipv4(h) => h.protocol,
+            Network::Ipv6(h) => h.protocol,
             _ => return None,
         };
         let ports = matches!(protocol, IPPROTO_TCP | IPPROTO_UDP)
@@ -127,11 +149,13 @@ impl<'a> Packet<'a> {
             _ => &[],
         };
         Some(Quoted {
+            header,
             protocol,
             src,
             dst,
             ports,
             udp_payload,
+            transport: rest,
         })
     }
 }
@@ -185,6 +209,7 @@ pub fn decode_bytes(link_type: u16, data: &[u8], orig_len: u32) -> Packet<'_> {
         transport: None,
         payload: &[],
         error: None,
+        offsets: Offsets::default(),
     };
     if let Err(mut err) = decode_layers(&mut pkt, link_type, data, missing) {
         if missing > 0 && matches!(err.problem, Problem::Truncated { .. }) {
@@ -206,18 +231,24 @@ fn decode_layers<'a>(
     let Some(ethertype) = ethertype else {
         return Ok(());
     };
+    let offset = |part: &[u8]| part.as_ptr() as usize - data.as_ptr() as usize;
+    pkt.offsets.network = offset(rest);
 
     // Protocol, captured payload and payload length on the wire, unless this
     // is a fragment that doesn't start with the transport header.
     let upper = match ethertype {
         ETHERTYPE_IPV4 => {
             let (header, payload, len) = ip::decode_v4(rest, missing)?;
+            pkt.offsets.transport = offset(payload);
+            pkt.offsets.end = offset(payload) + payload.len();
             let upper = (header.fragment_offset == 0).then_some((header.protocol, payload, len));
             pkt.network = Some(Network::Ipv4(header));
             upper
         }
         ETHERTYPE_IPV6 => {
             let (header, payload, len) = ip::decode_v6(rest, missing)?;
+            pkt.offsets.transport = offset(payload);
+            pkt.offsets.end = offset(payload) + payload.len();
             let first = header.fragment.is_none_or(|f| f.offset == 0);
             let upper = first.then_some((header.protocol, payload, len));
             pkt.network = Some(Network::Ipv6(header));
